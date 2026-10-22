@@ -4,7 +4,7 @@ A mistaken binding, close signal or recovery decision can terminate a living wor
 
 # Vocabulary
 
-- config: private roots, validated inner shell and process-execution seam · `src/config.rs`
+- config: private roots, shared shell/process façade and unsupported-platform fallback · `src/config.rs`, `src/shell.rs`, `src/unsupported.rs`
 - holder: systemd-owned inner PTY, child, attachment lease and private registry · `src/holder/`
 - attach: outer-terminal client and guarded holder-loss recovery · `src/attach/`
 - terminal: inner emulator, query replies and controlled redraw · `src/terminal/`
@@ -12,8 +12,8 @@ A mistaken binding, close signal or recovery decision can terminate a living wor
 - binding: holder generation and public identity aliases · `src/holder/registry.rs`, `src/herdr/mapping.rs`
 - reconciliation: coverage, orphan reporting and authenticated close observation · `src/herdr/reconcile.rs`, `src/herdr/observer.rs`
 - lifetime: user-service placement and PID/boot/start identity checks · `src/lifetime/`
-- test jail: dummy workloads, isolated paths and owned-resource cleanup · `tests/jail.rs`, `tests/herdr/real.py`, `tests/fakes/`
-- checks: structural gate and real-Herdr test entry point · `scripts/checks.sh`, `scripts/test-herdr.sh`
+- test jail: dummy workloads, isolated paths and owned-resource cleanup · `tests/jail.rs`, `tests/herdr/jail.py`, `tests/herdr/real.py`, `tests/fakes/`
+- checks: structural, mutation and real-Herdr gates · `scripts/checks.sh`, `scripts/gate_run.py`, `scripts/test-herdr.sh`
 - acceptance contract: numbered promises, launch-door census and verification gaps · `docs/spec.md`
 
 # Runtime
@@ -28,9 +28,9 @@ A mistaken binding, close signal or recovery decision can terminate a living wor
 ## Build and verification
 
 - Use the pinned `rust-toolchain.toml` and `Cargo.lock`.
-- Run in an explicit throwaway directory beneath TMPDIR with HOME, all XDG roots, CARGO_HOME, CARGO_TARGET_DIR and TMPDIR isolated. Set HERDR_SHIELD_TEST_ROOT to a fresh absolute subdirectory beneath that TMPDIR.
+- Create one short throwaway root; export it as TMPDIR and place HOME, every XDG root including XDG_RUNTIME_DIR, CARGO_HOME and CARGO_TARGET_DIR beneath it. Set HERDR_SHIELD_TEST_ROOT to a fresh absolute subdirectory there.
 - Run `cargo fmt --all -- --check`, `cargo clippy --all-targets --all-features -- -D warnings`, `cargo test --all-targets --all-features` and `bash scripts/checks.sh`.
-- For real-Herdr verification, set HERDR_SHIELD_BUILD_ROOT to the private throwaway root and HERDR_SHIELD_BIN to the absolute built executable; run `bash scripts/test-herdr.sh --herdr <pinned-v0.9.5-binary>`.
+- For real-Herdr verification, set HERDR_SHIELD_BUILD_ROOT to the private throwaway root, HERDR_SHIELD_BIN to the absolute debug executable and HERDR_SHIELD_OLD_BIN to a preserved compatible prior executable; run `bash scripts/test-herdr.sh --herdr <pinned-v0.9.5-binary>`.
 - Report acceptance rows against watched results. Missing tools, refused backends, timeouts, skipped tests and undiscovered suites are named gaps, never passes; a regression counts after its unfixed failure was observed.
 
 # Rules
