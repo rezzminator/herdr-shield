@@ -1,0 +1,30 @@
+id = "herdr-shield"
+name = "herdr shield"
+version = "0.1.0"
+min_herdr_version = "0.9.5"
+platforms = ["linux"]
+
+[[startup]]
+command = ["bin/herdr-shield", "reconcile"]
+
+[[events]]
+on = "pane.closed"
+command = ["bin/herdr-shield", "event"]
+
+[[events]]
+on = "pane.moved"
+command = ["bin/herdr-shield", "event"]
+
+[[events]]
+on = "tab.closed"
+command = ["bin/herdr-shield", "event"]
+
+[[events]]
+on = "workspace.closed"
+command = ["bin/herdr-shield", "event"]
+
+[[actions]]
+id = "list"
+title = "List protected panes and holders"
+contexts = ["global", "pane"]
+command = ["bin/herdr-shield", "action-list"]

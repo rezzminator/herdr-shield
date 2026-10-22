@@ -1,0 +1,4 @@
+/target/
+/bin/herdr-shield
+/.worktrees/
+__pycache__/
