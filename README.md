@@ -1,5 +1,13 @@
 # herdr shield
 
+## Contents
+
+- [Requirements and limits](#requirements-and-limits)
+- [Build and manual installation](#build-and-manual-installation)
+- [Commands and rollback](#commands-and-rollback)
+- [Terminal and API support](#terminal-and-api-support)
+- [Verification](#verification)
+
 herdr shield v1 keeps the same shell process and its private PTY alive when the
 outer Herdr server crashes. It protects new panes started through
 `terminal.default_shell`, using a verified Linux systemd user service.
@@ -9,10 +17,14 @@ outside the default-shell route, and panes already running at installation are
 **UNPROTECTED**. `herdr-shield list --json` and the plugin list action include every
 enumerated pane, its reason, the complete launch-door coverage table, holders,
 and orphan cleanup commands. Unknown provenance is UNPROTECTED. Failed pane
-enumeration is ERROR, not an empty successful list.
+enumeration is ERROR, not an empty successful list. An authenticated, read-only
+child census also reports PTYs hidden from public pane enumeration, such as
+popup and overlay terminals, with `pane_id: null`, their exact boot/start
+process identity, and an explicit UNPROTECTED reason. The census reports its
+observed count and OK or ERROR status. It is not a kill capability.
 
-This tree is an implementation under verification against [the spec](docs/spec.md).
-Do not treat unrun acceptance rows as a compatibility guarantee. The pinned
+The 27 active v1 acceptance rows have watched passing coverage. Rows 1 and 4
+require an upstream facility and are v2, outside the v1 gate. The pinned
 integration target is Herdr 0.9.5, protocol 22, commit
 `2ecf19a92fc3a7fff75b6ce3655ef04f4625ec01`.
 
@@ -21,7 +33,11 @@ integration target is Herdr 0.9.5, protocol 22, commit
 Linux, an available systemd user manager, and positive verification that each
 holder's cgroup belongs to its transient service outside any login session
 scope are required. Failed launch or verification prints UNPROTECTED and runs
-the explicitly configured plain shell. There is no detachment-backend fallback.
+the explicitly configured plain shell. On unsupported platforms, the entrypoint
+prints a clear refusal and execs that configured shell; it does not use a
+`setsid` fallback. `src/shell.rs` is the shared configuration/process façade,
+and `src/unsupported.rs` implements this unsupported-platform path. There is no
+detachment-backend fallback.
 Logout, user-manager shutdown and reboot can still end workloads. herdr shield
 does not enable linger or change system services.
 
@@ -131,13 +147,21 @@ PTY input/resize require the current lease, generation and increasing sequence.
 | Feature | Implementation / verification boundary |
 | --- | --- |
 | CR/LF, erase/insert, Unicode/wide/combining, scrolling, alternate screen | Alacritty model; fixed cell/redraw corpus |
-| SGR default/indexed/truecolor, cursor, app cursor/keypad, paste/mouse/focus modes | Controlled renderer and mode restore; real mouse hardware is unverified |
+| SGR default/indexed/truecolor, cursor, app cursor/keypad, paste/mouse/focus modes | Controlled renderer and mode restore; mouse protocol bytes are tested, physical mouse hardware is not |
 | DA/DSR, color, text size queries split over bytes | Exactly one inner responder; queries never replayed to Herdr |
 | Clipboard OSC 52 | Disabled for reads and writes |
 | Unknown/private OSC/DCS | Model ignores unsupported sequences; no raw forwarding |
 | OSC 7 / OSC 133 / title sideband | Bounded, audited cwd, A/B/C/D command markers and title metadata; reconnect restores only the latest cwd/title, never historic commands |
 | OSC 8 hyperlinks and advanced underline styles/colors | Rendered by the terminal model and covered by fixed protocol tests |
 | Attachment color probes | Validated current-attachment replies merge with retained/default palette; policy is visible in status and list |
+
+Ordinary input and terminal query replies use independent bounded queues. If a
+child does not consume stdin and the reply queue fills, the holder continues
+draining PTY output and exposes `terminal.query_error`.
+
+The holder does not hang, report successful delivery, automatically kill the
+process, or grow memory without bound. Finite in-scope query floods are
+delivered exactly once.
 
 The API relay uses vendored typed protocol-22 schemas and one exhaustive policy
 for all 102 methods. Server administration, plugin/integration installation,
@@ -157,9 +181,13 @@ selects and reconnects a living holder. A live handoff can rebind automatically
 only while the original attachment PID/boot/start identity is live and Herdr's
 shell_pid independently matches.
 
-Streams, exhaustive input/security matrices, detached RSS measurement,
-cross-version executable upgrades, and non-Linux/platform behavior remain
-UNVERIFIED or UNRUN. This development tree is not release-certified.
+The tested upgrade path runs distinct compatible old and new executables
+side-by-side: the new client can attach to the old holder, and an incompatible
+major version reports the preserved compatible-client path without disturbing
+the holder. Tests for non-Linux behavior exercise the unsupported entrypoint
+simulation and compile-time module selection; no actual non-Linux host was
+tested. These results do not guarantee logout, reboot, cross-version Herdr
+installer handoff, or physical mouse behavior.
 
 ## Verification
 
@@ -170,17 +198,36 @@ systemd user manager and use only `herdr-shield-test-` services. Missing tools,
 refused backends and skipped tests are errors, never passing suites.
 
 ```sh
+export HERDR_SHIELD_BUILD_ROOT="$(mktemp -d /tmp/hk.XXXXXX)"
+export TMPDIR="$HERDR_SHIELD_BUILD_ROOT"
+export HOME="$HERDR_SHIELD_BUILD_ROOT/home"
+export XDG_CONFIG_HOME="$HERDR_SHIELD_BUILD_ROOT/xdg-config"
+export XDG_CACHE_HOME="$HERDR_SHIELD_BUILD_ROOT/xdg-cache"
+export XDG_DATA_HOME="$HERDR_SHIELD_BUILD_ROOT/xdg-data"
+export XDG_STATE_HOME="$HERDR_SHIELD_BUILD_ROOT/xdg-state"
+export XDG_RUNTIME_DIR="$HERDR_SHIELD_BUILD_ROOT/xdg-runtime"
+export CARGO_HOME="$HERDR_SHIELD_BUILD_ROOT/cargo-home"
+export CARGO_TARGET_DIR="$HERDR_SHIELD_BUILD_ROOT/cargo-target"
+export HERDR_SHIELD_TEST_ROOT="$HERDR_SHIELD_BUILD_ROOT/tests"
+export HERDR_SHIELD_BIN="$CARGO_TARGET_DIR/debug/herdr-shield"
+export HERDR_SHIELD_OLD_BIN="${HERDR_SHIELD_OLD_BIN:?}"
+export HERDR_BIN="${HERDR_BIN:?set pinned Herdr 0.9.5 binary}"
+mkdir -p "$TMPDIR" "$HOME" "$XDG_CONFIG_HOME" "$XDG_CACHE_HOME" \
+  "$XDG_DATA_HOME" "$XDG_STATE_HOME" "$CARGO_HOME" "$CARGO_TARGET_DIR" \
+  "$HERDR_SHIELD_TEST_ROOT"
+mkdir -m 700 -p "$XDG_RUNTIME_DIR"
+
 cargo fmt --all -- --check
 cargo clippy --all-targets --all-features -- -D warnings
 cargo test --all-targets --all-features
 bash scripts/checks.sh
-HERDR_SHIELD_BUILD_ROOT=<absolute-private-root> \
-HERDR_SHIELD_BIN=<absolute-built-herdr-shield> \
-bash scripts/test-herdr.sh --herdr <pinned-v0.9.5-binary>
+bash scripts/test-herdr.sh --herdr "$HERDR_BIN"
 ```
 
-The real-Herdr jail validates its socket before every command, records exact
-owned process identities, uses dummy agents, and stops/resets only its uniquely
-named test services. Fault tests clean their resources even on failure. There
-is no live-install test and no claim of logout/reboot or cross-version handoff
-survival. Upstream schema attribution is in `LICENSE-HERDR`.
+The black-box process tests also require `HERDR_SHIELD_OLD_BIN`, a preserved
+compatible prior executable, to verify real old/new coexistence. Run every test
+with HOME and all XDG roots under the isolated test root and a verified
+throwaway Herdr socket. The real-Herdr jail validates its socket before every
+command, records exact owned process identities, uses dummy agents, and
+stops/resets only its uniquely named test services. Fault tests clean their
+resources even on failure. Upstream schema attribution is in `LICENSE-HERDR`.

@@ -73,7 +73,7 @@ fn size() -> (u16, u16) {
 pub fn default_shell(paths: &Paths) -> Result<()> {
     let config = paths.config()?;
     if std::env::var_os("HERDR_SHIELD_INNER").is_some() {
-        return fail("recursive keeper refused; run the configured inner shell directly");
+        return recovery::plain(&config, "recursive keeper refused");
     }
     let binding = match crate::herdr::binding() {
         Ok(value) => value,

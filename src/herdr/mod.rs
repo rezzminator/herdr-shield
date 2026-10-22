@@ -1,3 +1,4 @@
+pub mod census;
 pub mod mapping;
 pub mod observer;
 pub mod policy;

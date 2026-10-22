@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::sync::{
     Arc,
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicU32, Ordering},
 };
 use std::time::{Duration, Instant};
 
@@ -15,8 +15,11 @@ use serde_json::{Value, json};
 pub struct Jail {
     pub root: PathBuf,
     pub socket: PathBuf,
+    pub protocol: Arc<AtomicU32>,
+    pub extension: Arc<AtomicBool>,
     stop: Arc<AtomicBool>,
     thread: Option<std::thread::JoinHandle<()>>,
+    records: std::sync::Mutex<Vec<Value>>,
 }
 
 impl Jail {
@@ -63,6 +66,10 @@ impl Jail {
         let listener = UnixListener::bind(&socket).unwrap();
         listener.set_nonblocking(true).unwrap();
         let stop = Arc::new(AtomicBool::new(false));
+        let protocol = Arc::new(AtomicU32::new(22));
+        let mock_protocol = Arc::clone(&protocol);
+        let extension = Arc::new(AtomicBool::new(false));
+        let mock_extension = Arc::clone(&extension);
         let stopping = Arc::clone(&stop);
         let thread = std::thread::spawn(move || {
             while !stopping.load(Ordering::Relaxed) {
@@ -79,9 +86,12 @@ impl Jail {
                             if let Ok(request) = serde_json::from_str::<Value>(&line) {
                                 let result = match request["method"].as_str() {
                                     Some("ping") => {
-                                        json!({"type":"pong","protocol":22,"version":"0.9.5"})
+                                        json!({"type":"pong","protocol":mock_protocol.load(Ordering::Relaxed),"version":"0.9.5"})
                                     }
                                     Some("pane.list") => json!({"type":"pane_list","panes":[]}),
+                                    _ if mock_extension.load(Ordering::Relaxed) => {
+                                        json!({"type":"ok","unknown_extension":true})
+                                    }
                                     _ => json!({"type":"ok"}),
                                 };
                                 let _ = writeln!(
@@ -102,8 +112,11 @@ impl Jail {
         Self {
             root,
             socket,
+            protocol,
+            extension,
             stop,
             thread: Some(thread),
+            records: std::sync::Mutex::new(Vec::new()),
         }
     }
 
@@ -148,7 +161,15 @@ impl Jail {
             .map(|entry| entry.unwrap().path())
             .find(|path| path.file_stem().is_some_and(|stem| stem.len() == 32))
             .unwrap();
-        serde_json::from_slice(&fs::read(file).unwrap()).unwrap()
+        let meta: Value = serde_json::from_slice(&fs::read(file).unwrap()).unwrap();
+        self.records.lock().unwrap().push(meta.clone());
+        let mut ledger = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(self.root.join("owned-resources.jsonl"))
+            .unwrap();
+        writeln!(ledger, "{meta}").unwrap();
+        meta
     }
 }
 
@@ -167,45 +188,52 @@ impl Drop for Jail {
     fn drop(&mut self) {
         let mut identities = Vec::new();
         let mut sockets = Vec::new();
+        let mut records = self.records.lock().unwrap().clone();
         if self.root.join("state/herdr-shield").exists() {
             for entry in fs::read_dir(self.root.join("state/herdr-shield")).unwrap() {
                 let path = entry.unwrap().path();
                 if path.extension().is_some_and(|s| s == "json") {
                     if let Ok(meta) = serde_json::from_slice::<Value>(&fs::read(&path).unwrap()) {
-                        for key in ["holder", "child"] {
-                            if let (Some(pid), Some(start)) =
-                                (meta[key]["pid"].as_u64(), meta[key]["start"].as_u64())
-                            {
-                                identities.push((pid, start));
-                            }
-                        }
-                        if let Some(id) = meta["id"].as_str().filter(|id| {
-                            id.len() == 32 && id.bytes().all(|b| b.is_ascii_hexdigit())
-                        }) {
-                            for name in ["holder.sock", "herdr-api.sock"] {
-                                sockets.push(self.root.join("run/herdr-shield").join(id).join(name));
-                            }
-                        }
-                        if let Some(unit) = meta["unit"].as_str().filter(|unit| {
-                            unit.starts_with("herdr-shield-test-") && unit.ends_with(".service")
-                        }) {
-                            let bus =
-                                format!("unix:path=/run/user/{}/bus", nix::unistd::Uid::current());
-                            for action in ["stop", "reset-failed"] {
-                                let output = Command::new("systemctl")
-                                    .args([
-                                        "--user",
-                                        &format!("--machine={}@.host", nix::unistd::Uid::current()),
-                                        action,
-                                        unit,
-                                    ])
-                                    .env("DBUS_SESSION_BUS_ADDRESS", &bus)
-                                    .output()
-                                    .unwrap();
-                                println!("CLEANUP unit {unit}: {action} {}", output.status);
-                            }
-                        }
+                        records.push(meta);
                     }
+                }
+            }
+        }
+        records.sort_by_key(|meta| meta["id"].as_str().unwrap_or("").to_owned());
+        records.dedup_by(|left, right| left["id"] == right["id"]);
+        for meta in records {
+            for key in ["holder", "child"] {
+                if let (Some(pid), Some(start)) =
+                    (meta[key]["pid"].as_u64(), meta[key]["start"].as_u64())
+                {
+                    identities.push((pid, start));
+                }
+            }
+            if let Some(id) = meta["id"]
+                .as_str()
+                .filter(|id| id.len() == 32 && id.bytes().all(|b| b.is_ascii_hexdigit()))
+            {
+                for name in ["holder.sock", "herdr-api.sock"] {
+                    sockets.push(self.root.join("run/herdr-shield").join(id).join(name));
+                }
+            }
+            if let Some(unit) = meta["unit"]
+                .as_str()
+                .filter(|unit| unit.starts_with("herdr-shield-test-") && unit.ends_with(".service"))
+            {
+                let bus = format!("unix:path=/run/user/{}/bus", nix::unistd::Uid::current());
+                for action in ["stop", "reset-failed"] {
+                    let output = Command::new("systemctl")
+                        .args([
+                            "--user",
+                            &format!("--machine={}@.host", nix::unistd::Uid::current()),
+                            action,
+                            unit,
+                        ])
+                        .env("DBUS_SESSION_BUS_ADDRESS", &bus)
+                        .output()
+                        .unwrap();
+                    println!("CLEANUP unit {unit}: {action} {}", output.status);
                 }
             }
         }

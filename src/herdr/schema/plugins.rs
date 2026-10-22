@@ -1,4 +1,4 @@
-// Adapted from herdrdev/herdr @ 2ecf19a92fc3a7fff75b6ce3655ef04f4625ec01 (MIT).
+// Adapted from herdrdev/herdr @ 2ecf19a92fc3a7fff75b6ce3655ef04f4625ec01 (Apache-2.0).
 use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};

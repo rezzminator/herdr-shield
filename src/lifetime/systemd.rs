@@ -22,15 +22,20 @@ fn manager(program: &str) -> std::process::Command {
 }
 
 pub fn available() -> Result<()> {
-    if !cfg!(target_os = "linux") {
-        return fail("Linux with a verified systemd user manager is required");
-    }
+    platform(cfg!(target_os = "linux"))?;
     let output = manager("systemctl")
         .args(["show", "--property=Version", "--value"])
         .stdin(Stdio::null())
         .output()?;
     if !output.status.success() || output.stdout.is_empty() {
         return fail("systemd user manager unavailable or unverified");
+    }
+    Ok(())
+}
+
+fn platform(linux: bool) -> Result<()> {
+    if !linux {
+        return fail("Linux with a verified systemd user manager is required");
     }
     Ok(())
 }
@@ -189,6 +194,13 @@ mod tests {
 
     #[test]
     fn cgroup_requires_user_manager_and_exact_unit_outside_login_scope() {
+        assert!(platform(true).is_ok());
+        assert!(
+            platform(false)
+                .unwrap_err()
+                .to_string()
+                .contains("Linux with a verified systemd user manager is required")
+        );
         let unit = "herdr-shield-test-a.service";
         assert!(escaped(
             &format!("0::/user.slice/user-1.slice/user@1.service/app.slice/{unit}\n"),

@@ -75,10 +75,14 @@ impl Frame {
 
 pub fn peer(stream: &UnixStream) -> Result<u32> {
     let cred = getsockopt(stream, PeerCredentials)?;
-    if cred.uid() != Uid::current().as_raw() {
+    peer_identity(cred.uid(), cred.pid())
+}
+
+fn peer_identity(uid: u32, pid: i32) -> Result<u32> {
+    if uid != Uid::current().as_raw() {
         return fail("unauthorized: peer is not this user");
     }
-    Ok(cred.pid().try_into()?)
+    Ok(pid.try_into()?)
 }
 
 pub fn read(reader: &mut impl Read) -> Result<Frame> {
@@ -129,6 +133,20 @@ pub fn exchange(stream: &mut UnixStream, request: &Frame) -> Result<Frame> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn kernel_peer_credentials_and_different_uid_refusal() {
+        let (left, _right) = UnixStream::pair().unwrap();
+        assert_eq!(peer(&left).unwrap(), std::process::id());
+        let other = Uid::current().as_raw().wrapping_add(1);
+        assert!(
+            peer_identity(other, std::process::id() as i32)
+                .unwrap_err()
+                .to_string()
+                .contains("unauthorized")
+        );
+        assert!(peer_identity(Uid::current().as_raw(), -1).is_err());
+    }
 
     #[test]
     fn frame_codec_limits_and_chunked_input() {

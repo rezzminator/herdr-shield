@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use nix::unistd::Uid;
 use serde::{Deserialize, Serialize};
 
+pub use crate::shell::{Config, command};
 use crate::{Result, fail};
 
 pub const MAX_JSON: usize = 1024 * 1024;
@@ -16,14 +17,6 @@ pub struct Paths {
     pub config: PathBuf,
     pub state: PathBuf,
     pub runtime: PathBuf,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct Config {
-    pub shell: PathBuf,
-    #[serde(default)]
-    pub args: Vec<String>,
 }
 
 impl Paths {
@@ -58,24 +51,6 @@ impl Paths {
             return fail("runtime socket path too long; choose a shorter XDG_RUNTIME_DIR");
         }
         Ok(path)
-    }
-}
-
-impl Config {
-    pub fn validate(&self) -> Result<()> {
-        let shell = fs::canonicalize(&self.shell)?;
-        if !self.shell.is_absolute()
-            || !shell.is_file()
-            || fs::metadata(&shell)?.permissions().mode() & 0o111 == 0
-            || shell == fs::canonicalize(std::env::current_exe()?)?
-            || shell.file_name().is_some_and(|n| n == "herdr-shield")
-        {
-            return fail("inner shell must be an explicit executable and cannot be herdr-shield");
-        }
-        if self.args.iter().any(|a| a.contains('\0')) {
-            return fail("shell argv contains NUL");
-        }
-        Ok(())
     }
 }
 
@@ -289,13 +264,58 @@ pub fn valid_id(id: &str) -> Result<()> {
     }
 }
 
-pub fn command(program: impl AsRef<std::ffi::OsStr>) -> std::process::Command {
-    std::process::Command::new(program)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn atomic_write_failure_preserves_old_record_and_removes_staging_files() {
+        struct Broken;
+        impl Serialize for Broken {
+            fn serialize<S: serde::Serializer>(
+                &self,
+                serializer: S,
+            ) -> std::result::Result<S::Ok, S::Error> {
+                use serde::ser::SerializeMap;
+                let mut map = serializer.serialize_map(Some(1))?;
+                map.serialize_entry("revision", &2)?;
+                Err(serde::ser::Error::custom("INJECTED_WRITE_FAILURE"))
+            }
+        }
+        let root = std::env::temp_dir().join(format!("atomic-{}", random_id().unwrap()));
+        secure_dir(&root).unwrap();
+        let path = root.join("record.json");
+        atomic_json(&path, &serde_json::json!({"revision":1})).unwrap();
+        assert!(
+            atomic_json(&path, &Broken)
+                .unwrap_err()
+                .to_string()
+                .contains("INJECTED_WRITE_FAILURE")
+        );
+        assert_eq!(
+            read_json::<serde_json::Value>(&path).unwrap()["revision"],
+            1
+        );
+        assert_eq!(
+            fs::read_dir(&root).unwrap().count(),
+            1,
+            "staging file survived failed serialization"
+        );
+        let directory = root.join("destination");
+        secure_dir(&directory).unwrap();
+        fs::write(directory.join("sentinel"), "preserved").unwrap();
+        assert!(atomic_json(&directory, &serde_json::json!({"revision":2})).is_err());
+        assert_eq!(
+            fs::read_to_string(directory.join("sentinel")).unwrap(),
+            "preserved"
+        );
+        assert_eq!(
+            fs::read_dir(&root).unwrap().count(),
+            2,
+            "staging file survived failed rename"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn private_open_rejects_fifo_without_waiting_for_a_writer() {

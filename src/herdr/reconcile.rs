@@ -85,6 +85,7 @@ pub fn report(paths: &Paths) -> Result<Value> {
     };
     let mut panes = Vec::new();
     let mut holders = Vec::new();
+    let mut known_processes = Vec::new();
     for meta in &metas {
         let status = holder::client(paths, meta).and_then(|mut stream| {
             protocol::exchange(&mut stream, &Frame::new(&meta.id, "status", json!({})))
@@ -108,6 +109,19 @@ pub fn report(paths: &Paths) -> Result<Value> {
     }
     if let Ok(enumerated) = &enumeration {
         for pane in enumerated {
+            if let Ok(process) = super::rpc(
+                endpoint.as_ref().unwrap(),
+                "pane.process_info",
+                json!({"pane_id":pane.pane_id}),
+            ) {
+                if let Some(pid) = process["process_info"]["shell_pid"].as_u64() {
+                    if let Ok(pid) = u32::try_from(pid) {
+                        if let Ok(identity) = crate::lifetime::identity::Identity::read(pid) {
+                            known_processes.push(identity);
+                        }
+                    }
+                }
+            }
             let candidates: Vec<_> = metas
                 .iter()
                 .filter(|meta| {
@@ -166,7 +180,35 @@ pub fn report(paths: &Paths) -> Result<Value> {
             panes.push(json!({"pane_id":pane.pane_id,"terminal_id":pane.terminal_id,"status":if protected {"PROTECTED"}else{"UNPROTECTED"},"reason":reason}));
         }
     }
-    let error = enumeration.as_ref().err().map(ToString::to_string);
+    let process_census = endpoint
+        .as_ref()
+        .map_err(ToString::to_string)
+        .and_then(|socket| {
+            super::connect(socket)
+                .and_then(|stream| {
+                    let server =
+                        crate::lifetime::identity::Identity::read(protocol::peer(&stream)?)?;
+                    super::census::pty_children(&server)
+                })
+                .map_err(|error| error.to_string())
+        });
+    if let Ok(processes) = &process_census {
+        for process in processes {
+            if !known_processes.contains(process) {
+                panes.push(json!({"pane_id":null,"process":process,"status":"UNPROTECTED","reason":"PTY absent from public pane enumeration; popup/overlay or unavailable launch provenance; process did not positively enter a verified default-shell holder"}));
+            }
+        }
+    }
+    let error = enumeration
+        .as_ref()
+        .err()
+        .map(ToString::to_string)
+        .or_else(|| {
+            process_census
+                .as_ref()
+                .err()
+                .map(|error| format!("PTY census ERROR: {error}"))
+        });
     let persisted = paths.state.join("last-error.json");
     let previous = if persisted.exists() {
         Some(crate::config::read_json::<Value>(&persisted)?)
@@ -174,7 +216,7 @@ pub fn report(paths: &Paths) -> Result<Value> {
         None
     };
     Ok(
-        json!({"enumeration":if error.is_some(){"ERROR"}else if panes.is_empty(){"EMPTY"}else{"OK"},"error":error,"previous_reconciliation_error":previous,"panes":panes,"holders":holders,"coverage":DOORS.iter().map(|(door,status)|json!({"door":door,"status":status})).collect::<Vec<_>>()}),
+        json!({"enumeration":if error.is_some(){"ERROR"}else if panes.is_empty(){"EMPTY"}else{"OK"},"error":error,"pty_enumeration":{"status":if process_census.is_ok(){"OK"}else{"ERROR"},"observed":process_census.as_ref().ok().map(Vec::len)},"previous_reconciliation_error":previous,"panes":panes,"holders":holders,"coverage":DOORS.iter().map(|(door,status)|json!({"door":door,"status":status})).collect::<Vec<_>>()}),
     )
 }
 

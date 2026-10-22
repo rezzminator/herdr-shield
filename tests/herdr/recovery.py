@@ -73,8 +73,14 @@ def resume_test(jail):
     assert partial['agent_session']['source']=='herdr:codex'
     assert partial['agent_resume']['argv']==argv,partial
     print('PASS real partial mutation: native error still persisted session identity; rejected native argv never became accepted fallback',flush=True)
+    ssh_argv = ['ssh', 'fixture.invalid', 'dummy-agent', 'resume', 'remote-session']
+    accepted = report('custom:dummy', 'python3', 4, ssh_argv, helper=True)
+    assert accepted['response']['result']['type'] == 'ok', accepted
+    remote = wait(lambda: value if (value := current().get('resume')) and value['argv'] == ssh_argv else None)
+    assert remote['process'] is None, 'local SSH-style reporting cannot prove remote workload death'
+    print('PASS SSH-style accepted resume capture: remote argv preserved, local reporting helper never supplies remote process-death proof', flush=True)
     # Re-establish a deliberately accepted custom command after native mutation.
-    accepted = report('custom:dummy', 'python3', 4, argv + ['FINAL'], helper=True)
+    accepted = report('custom:dummy', 'python3', 5, argv + ['FINAL'], helper=True)
     assert accepted['response']['result']['type'] == 'ok', accepted
     argv += ['FINAL']
     captured = wait(lambda: value if (value := current().get('resume')) and value['argv'] == argv else None)
@@ -126,6 +132,15 @@ def resume_test(jail):
         record.write_text(json.dumps(unknown))
         choose(b'\r',False)
         assert live(meta['child']['pid'])
+        for name, patch in [('reused', {'start': captured['process']['start'] + 1}),
+                            ('remote-ssh', {'boot': 'ssh:remote-dummy-session'}),
+                            ('invalid-pid', {'pid': 0}), ('unknown-start', {'start': 0})]:
+            value = json.loads(saved)
+            value['resume']['process'].update(patch)
+            record.write_text(json.dumps(value))
+            choose(b'\r', False)
+            assert live(meta['child']['pid']), name
+            print('PASS recovery identity matrix:', name, 'suppresses Enter without execution', flush=True)
     finally:
         record.write_bytes(saved)
         held.rename(endpoint)

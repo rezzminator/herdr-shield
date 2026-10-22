@@ -96,8 +96,17 @@ impl State {
         let mut reader = pair.master.try_clone_reader()?;
         let mut pty_writer = pair.master.take_writer()?;
         let (writer, input) = sync_channel::<Vec<u8>>(32);
+        let (query_sender, queries) = sync_channel::<Vec<u8>>(32);
         std::thread::spawn(move || {
-            for bytes in input {
+            loop {
+                let bytes = match queries.try_recv() {
+                    Ok(bytes) => bytes,
+                    Err(_) => match input.recv_timeout(std::time::Duration::from_millis(5)) {
+                        Ok(bytes) => bytes,
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+                        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                    },
+                };
                 if pty_writer.write_all(&bytes).is_err() {
                     eprintln!("herdr-shield: PTY writer failed (input redacted)");
                     break;
@@ -109,7 +118,7 @@ impl State {
             .map_err(|_| "terminal mutex poisoned")?
             .resize(size);
         let terminal = Arc::clone(&self.terminal);
-        let query_writer = writer.clone();
+        let query_writer = query_sender;
         std::thread::spawn(move || {
             let result = (|| -> Result<()> {
                 let mut bytes = [0u8; 8192];
@@ -130,16 +139,16 @@ impl State {
                         }
                     }
                     drop(model);
+                    // Ordinary-input backpressure cannot block output draining or consume reply capacity.
                     if !replies.is_empty() && query_writer.try_send(replies).is_err() {
                         terminal
                             .lock()
                             .map_err(|_| "terminal mutex poisoned")?
                             .query_error = Some(
-                            "terminal query delivery failed: child input queue full or unavailable"
-                                .into(),
+                            "terminal query delivery failed: reply queue full or writer unavailable".into(),
                         );
                         eprintln!(
-                            "herdr-shield: terminal query reply queue unavailable; child is not reading input"
+                            "herdr-shield: terminal query reply queue full or writer unavailable"
                         );
                     }
                 }

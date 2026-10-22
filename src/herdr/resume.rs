@@ -286,10 +286,16 @@ pub fn observe(shared: &Shared, request: &Value, response: &Value, generation: u
     }
     let shared = std::sync::Arc::clone(shared);
     let response = response.clone();
-    std::thread::spawn(move || {
-        let _ = observe_saved(&shared, &tracked, &response, generation);
+    let worker = std::thread::Builder::new()
+        .name("herdr-capture".into())
+        .spawn(move || {
+            let _ = observe_saved(&shared, &tracked, &response, generation);
+            WORKERS.fetch_sub(1, Ordering::AcqRel);
+        });
+    if let Err(error) = worker {
         WORKERS.fetch_sub(1, Ordering::AcqRel);
-    });
+        return Err(format!("accepted-state verification worker could not start: {error}").into());
+    }
     Ok(())
 }
 
@@ -501,6 +507,39 @@ mod tests {
         );
         observe_saved(&shared, &stale, &json!({"result":{"type":"ok"}}), 1).unwrap();
         assert!(shared.lock().unwrap().meta.resume.is_none());
+        let pending = track(&shared, &request(6, "pending"), 0).unwrap();
+        for _ in 0..128 {
+            observe(&shared, &pending, &json!({"result":{"type":"ok"}}), 1).unwrap();
+        }
+        let active = || {
+            std::fs::read_dir("/proc/self/task")
+                .unwrap()
+                .filter_map(|entry| std::fs::read_to_string(entry.ok()?.path().join("comm")).ok())
+                .filter(|name| name.trim() == "herdr-capture")
+                .count()
+        };
+        let started = Instant::now() + Duration::from_secs(2);
+        while active() < 4 {
+            assert!(
+                Instant::now() < started,
+                "capture workers were not independently enumerated"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(
+            active(),
+            4,
+            "capture report flood exceeded four independently observed worker threads"
+        );
+        shared.lock().unwrap().meta.report_epoch += 1;
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while active() != 0 {
+            assert!(
+                Instant::now() < deadline,
+                "stale capture workers did not end"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
         std::fs::remove_dir_all(root).unwrap();
     }
     #[test]

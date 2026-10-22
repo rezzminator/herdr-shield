@@ -44,6 +44,19 @@ def wait(predicate, seconds=15):
     raise TimeoutError(f'predicate timeout; last={last}')
 
 
+class ProcessRecords(list):
+    def __init__(self, root):
+        super().__init__()
+        self.path = root / 'owned-processes.jsonl'
+
+    def append(self, value):
+        process, observed, role = value
+        assert observed is not None, 'ERROR: started process identity was not recorded'
+        with self.path.open('a') as output:
+            output.write(json.dumps(dict(pid=process.pid, start=observed[1], role=role)) + '\n')
+        super().append(value)
+
+
 class Jail:
     def __init__(self, root, herdr, keeper):
         assert root.is_absolute() and root.is_dir() and not root.is_symlink()
@@ -52,7 +65,8 @@ class Jail:
         assert not self.root.exists(), 'fresh jail required'
         self.root.mkdir(mode=0o700)
         self.herdr, self.keeper = herdr, keeper
-        self.processes, self.units, self.clients, self.logs = [], set(), [], []
+        self.processes, self.units, self.clients, self.logs = ProcessRecords(self.root), set(), [], []
+        self.client_output = []
         self.handoff_pending = False
         self.env = {'HOME': str(self.root), 'PATH': '/usr/bin:/bin', 'TERM': 'xterm-256color',
                     'LANG': 'C.UTF-8', 'SHELL': '/bin/sh', 'HERDR_SHIELD_TEST_PREFIX': 'herdr-shield-test-', 'HERDR_SHIELD_TEST_BIN':keeper}
@@ -136,17 +150,26 @@ class Jail:
         self.guard()
         master, slave = pty.openpty()
         fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack('HHHH', 32, 100, 0, 0))
+        def terminal_session():
+            os.setsid()
+            fcntl.ioctl(slave, termios.TIOCSCTTY, 0)
         process = subprocess.Popen([self.herdr], env=self.env, cwd=self.root, stdin=slave,
-                                   stdout=slave, stderr=slave, start_new_session=True)
+                                   stdout=slave, stderr=slave, preexec_fn=terminal_session)
         os.close(slave)
         self.processes.append((process, identity(process.pid), 'client'))
         stop = threading.Event()
+        output = bytearray()
+        self.client_output.append(output)
         def drain():
             while not stop.is_set():
                 if select.select([master], [], [], 0.1)[0]:
                     try:
-                        if not os.read(master, 65536):
+                        chunk = os.read(master, 65536)
+                        if not chunk:
                             return
+                        output.extend(chunk)
+                        if len(output) > 2 * 1024 * 1024:
+                            del output[:-1024 * 1024]
                     except OSError:
                         return
         thread = threading.Thread(target=drain, daemon=True)
@@ -174,8 +197,24 @@ class Jail:
 
     def terminate(self, process, sig=signal.SIGTERM):
         record = next(entry for entry in self.processes if entry[0] is process)
-        assert record[1] is not None and identity(process.pid)[:2] == record[1][:2] if process.poll() is None else True
         if process.poll() is None:
+            observed = identity(process.pid)
+            if observed is None or observed[2] in ('Z', 'X'):
+                process.wait(timeout=1)
+                print('CLEANUP', record[2], process.pid, process.returncode, flush=True)
+                return
+            assert record[1] is not None and observed[:2] == record[1][:2]
+            try:
+                environment = pathlib.Path(f'/proc/{process.pid}/environ').read_bytes().split(b'\0')
+            except (PermissionError, FileNotFoundError) as error:
+                try:
+                    process.wait(timeout=1)
+                except subprocess.TimeoutExpired:
+                    raise error
+                print('CLEANUP', record[2], process.pid, process.returncode, flush=True)
+                return
+            for name in ('HOME', 'XDG_CONFIG_HOME', 'XDG_STATE_HOME', 'XDG_DATA_HOME', 'XDG_CACHE_HOME', 'XDG_RUNTIME_DIR'):
+                assert (name + '=' + self.env[name]).encode() in environment, 'ERROR: process outside owned jail: ' + name
             os.kill(process.pid, sig)
             try:
                 process.wait(timeout=5)
@@ -186,15 +225,24 @@ class Jail:
 
     def close(self):
         adoption_error = None
+        cleanup_errors = []
         if self.handoff_pending:
-            try:
-                self.record_handoff_server()
-            except (AssertionError, OSError) as error:
-                adoption_error = error
-                print('ERROR handoff ownership could not be verified; retained unknown process', repr(error), flush=True)
+            for attempt in range(2):
+                try:
+                    self.record_handoff_server()
+                    break
+                except (AssertionError, OSError) as error:
+                    adoption_error = error
+                    print('ERROR handoff ownership could not be verified; no signal sent; attempt', attempt + 1, repr(error), flush=True)
         self.metadata()
         for process, _, _ in reversed(self.processes):
-            self.terminate(process)
+            for attempt in range(2):
+                try:
+                    self.terminate(process)
+                    break
+                except (OSError, subprocess.TimeoutExpired, AssertionError) as error:
+                    cleanup_errors.append(repr(error))
+                    print('ERROR exact owned-process cleanup failed; attempt', attempt + 1, repr(error), flush=True)
         bus = f'unix:path=/run/user/{os.getuid()}/bus'
         unit_env = dict(self.env, DBUS_SESSION_BUS_ADDRESS=bus)
         for unit in sorted(self.units):
@@ -225,6 +273,8 @@ class Jail:
         assert not remaining
         if adoption_error is not None:
             raise RuntimeError('handoff ownership verification failed during cleanup') from adoption_error
+        if cleanup_errors:
+            raise RuntimeError('owned-process cleanup required recovery: ' + '; '.join(cleanup_errors))
 
     def record_handoff_server(self):
         self.guard()
@@ -267,6 +317,7 @@ def exercise(jail):
     client = jail.client()
     panes = wait(lambda: jail.api('pane.list')['panes'])
     pane = panes[0]['pane_id']
+    initial_terminal_id = panes[0]['terminal_id']
     meta = wait(lambda: next((m for m in jail.metadata() if m['binding']['pane'] == pane and m['state'] == 'running'), None))
     original = identity(meta['child']['pid'])
     holder = identity(meta['holder']['pid'])
@@ -283,6 +334,8 @@ def exercise(jail):
     server = jail.server()
     client = jail.client()
     wait(lambda: 'ambiguouspaneinstance' in ''.join(jail.api('pane.read', {'pane_id': pane, 'source': 'visible'})['read']['text'].split()))
+    restored_terminal_id = jail.api('pane.get', {'pane_id': pane})['pane']['terminal_id']
+    assert restored_terminal_id != initial_terminal_id, 'cold restore did not exercise changed internal TerminalId'
     assert next(m for m in jail.metadata() if m['id']==meta['id'])['binding']['server']['pid']!=server.pid
     listed=jail.keep('list','--json')
     assert listed.returncode==0,listed.stderr
@@ -314,8 +367,14 @@ def exercise(jail):
     assert live(original[0]), 'close killed unrelated holder'
     print('PASS close-vs-crash: authenticated close kills matching child; crash retains original', flush=True)
     # This command intentionally bypasses the default-shell launch door.
+    before_layout = {p['pane_id'] for p in jail.api('pane.list')['panes']}
     jail.api('layout.apply', {'workspace_id': 'w1', 'tab_label': 'unprotected', 'focus': False,
                              'root': {'type': 'pane', 'command': ['/bin/sh', '-c', 'read value']}})
+    respawn_pane = next(p['pane_id'] for p in jail.api('pane.list')['panes'] if p['pane_id'] not in before_layout)
+    before_layout.add(respawn_pane)
+    jail.api('layout.apply', {'workspace_id': 'w1', 'tab_label': 'unprotected-replacement', 'focus': False,
+                             'root': {'type': 'pane', 'command': ['/bin/sh', '-c', 'read value']}})
+    plain_respawn = next(p['pane_id'] for p in jail.api('pane.list')['panes'] if p['pane_id'] not in before_layout)
     listed = jail.keep('list', '--json')
     assert listed.returncode == 0, listed.stderr
     coverage = json.loads(listed.stdout)
@@ -343,6 +402,7 @@ def exercise(jail):
     print('PASS two real pane moves: complete intermediate alias history routes both old pane IDs to current holder',flush=True)
     # Handoff is intentionally a named gap unless the combined restart is exercised below.
     before_generation=next(m for m in jail.metadata() if m['id']==meta['id'])['generation']
+    before_handoff_terminal = jail.api('pane.get', {'pane_id': pane})['pane']['terminal_id']
     jail.handoff_pending = True
     result = jail.api('server.live_handoff', {'import_exe': jail.herdr, 'expected_protocol': 22, 'expected_version': '0.9.5'})
     print('HANDOFF result', result, flush=True)
@@ -359,11 +419,33 @@ def exercise(jail):
     jail.api('pane.send_text', {'pane_id': pane, 'text': 'tick\r'})
     wait(lambda: 'COUNTER=4' in jail.api('pane.read', {'pane_id': pane, 'source': 'visible'})['read']['text'])
     assert next(m for m in jail.metadata() if m['id']==meta['id'])['generation']==before_generation+1
+    assert jail.api('pane.get', {'pane_id': pane})['pane']['terminal_id'] != before_handoff_terminal, 'handoff did not exercise changed internal TerminalId'
     print('PASS same-binary handoff: original child retained, server generation rebound, counter input 3 -> 4 verified', flush=True)
+    # Imported launch argv has a real respawn-shell-on-exit path in pinned Herdr.
+    # One replacement uses the wrapper, the other a deliberately plain configured shell.
+    jail.api('pane.send_text', {'pane_id': respawn_pane, 'text': 'finish\r'})
+    replacement = wait(lambda: next((m for m in jail.metadata() if m['binding']['pane'] == respawn_pane and m['state'] == 'running'), None))
+    wait(lambda: next(p for p in json.loads(jail.keep('list', '--json').stdout)['panes'] if p['pane_id'] == respawn_pane)['status'] == 'PROTECTED')
+    config = jail.root / 'c/herdr/config.toml'
+    saved_config = config.read_text()
+    config.write_text(saved_config.replace(json.dumps(jail.keeper), json.dumps(str(jail.root / 'dummy-shell'))))
+    jail.api('server.reload_config')
+    old_shell = jail.api('pane.process_info', {'pane_id': plain_respawn})['process_info']['shell_pid']
+    try:
+        jail.api('pane.send_text', {'pane_id': plain_respawn, 'text': 'finish\r'})
+        wait(lambda: jail.api('pane.process_info', {'pane_id': plain_respawn})['process_info']['shell_pid'] != old_shell)
+        value = json.loads(jail.keep('action-list').stdout)
+        row = next(p for p in value['panes'] if p['pane_id'] == plain_respawn)
+        assert row['status'] == 'UNPROTECTED' and row['reason']
+        assert live(replacement['child']['pid']) and live(original[0])
+    finally:
+        config.write_text(saved_config)
+        jail.api('server.reload_config')
+    print('PASS imported saved-launch argv and real production shell respawn: wrapper replacement PROTECTED; plain replacement visibly UNPROTECTED; unrelated holders retained', flush=True)
     jail.api('pane.close', {'pane_id':pane})
     wait(lambda: not live(original[0]))
     print('PASS close after move and handoff targets the original child', flush=True)
-    print('UNRUN: cross-version installer handoff, real mouse hardware, exhaustive launch-door UI exercises', flush=True)
+    print('NOTE: cross-version installer handoff and physical mouse hardware are outside the v1 acceptance boundary', flush=True)
 
 
 def main():

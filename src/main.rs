@@ -1,12 +1,23 @@
+#[cfg(target_os = "linux")]
 mod attach;
+#[cfg(target_os = "linux")]
 mod config;
+#[cfg(target_os = "linux")]
 mod herdr;
+#[cfg(target_os = "linux")]
 mod holder;
+#[cfg(target_os = "linux")]
 mod lifetime;
+mod shell;
+#[cfg(target_os = "linux")]
 mod terminal;
+#[cfg(any(test, not(target_os = "linux")))]
+mod unsupported;
 
+#[cfg(target_os = "linux")]
 use std::io::{IsTerminal, Write};
 
+#[cfg(target_os = "linux")]
 use serde_json::json;
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
@@ -15,6 +26,7 @@ fn fail<T>(message: &str) -> Result<T> {
     Err(message.to_owned().into())
 }
 
+#[cfg(target_os = "linux")]
 const COMMANDS: &[(&str, &str)] = &[
     (
         "attach <holder-id>",
@@ -46,6 +58,7 @@ const COMMANDS: &[(&str, &str)] = &[
     ),
 ];
 
+#[cfg(target_os = "linux")]
 fn main() {
     if let Err(error) = run() {
         eprintln!("herdr-shield: {error}");
@@ -53,6 +66,27 @@ fn main() {
     }
 }
 
+#[cfg(not(target_os = "linux"))]
+fn main() {
+    let result = (|| -> Result<()> {
+        if std::env::args_os().len() != 1 {
+            return fail("UNPROTECTED: Linux with a verified systemd user manager is required");
+        }
+        let root = std::env::var_os("XDG_CONFIG_HOME")
+            .map(std::path::PathBuf::from)
+            .or_else(|| {
+                std::env::var_os("HOME").map(|home| std::path::PathBuf::from(home).join(".config"))
+            })
+            .ok_or("HOME or XDG_CONFIG_HOME is required to locate the configured plain shell")?;
+        unsupported::run(&root.join("herdr-shield/config.json"))
+    })();
+    if let Err(error) = result {
+        eprintln!("herdr-shield: {error}");
+        std::process::exit(1);
+    }
+}
+
+#[cfg(target_os = "linux")]
 fn run() -> Result<()> {
     let args: Vec<_> = std::env::args().skip(1).collect();
     if args
@@ -95,6 +129,7 @@ fn run() -> Result<()> {
     }
 }
 
+#[cfg(target_os = "linux")]
 fn doctor(paths: &config::Paths) -> Result<()> {
     paths.config()?;
     lifetime::systemd::available()?;
@@ -132,6 +167,7 @@ fn doctor(paths: &config::Paths) -> Result<()> {
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
 fn kill(paths: &config::Paths, args: &[String]) -> Result<()> {
     let meta = holder::registry::Metadata::load(paths, &args[1])?;
     let confirmed = if args.len() == 4 {

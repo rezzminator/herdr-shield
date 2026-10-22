@@ -1,3 +1,5 @@
+#[path = "coverage.rs"]
+mod coverage;
 #[path = "../jail.rs"]
 mod jail;
 

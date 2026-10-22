@@ -211,6 +211,169 @@ mod tests {
     use serde_json::json;
 
     #[test]
+    fn closed_identity_field_and_nested_request_matrix_preserves_opaque_values() {
+        let mut aliases = Aliases::default();
+        for (old, new) in [("w1:p1", "w4:p4"), ("w1:t1", "w4:t4"), ("w1", "w4")] {
+            aliases.insert(old, new);
+        }
+        let fields = [
+            "pane_id",
+            "target_pane_id",
+            "source_pane_id",
+            "caller_pane_id",
+            "focused_pane_id",
+            "tab_id",
+            "workspace_id",
+            "source_workspace_id",
+            "before_workspace_id",
+        ];
+        for field in fields {
+            let (old, new) = if field.ends_with("workspace_id") {
+                ("w1", "w4")
+            } else if field == "tab_id" {
+                ("w1:t1", "w4:t4")
+            } else {
+                ("w1:p1", "w4:p4")
+            };
+            let mut params = json!({field:old,"source":old,"agent_session_id":old,"text":old,"argv":[old],"env":{field:old},"tokens":{field:old}});
+            aliases.request("pane.get", &mut params).unwrap();
+            assert_eq!(params[field], new, "direct identity {field}");
+            for opaque in ["source", "agent_session_id", "text"] {
+                assert_eq!(params[opaque], old);
+            }
+            assert_eq!(params["argv"][0], old);
+            assert_eq!(params["env"][field], old);
+            assert_eq!(params["tokens"][field], old);
+        }
+        let cases = [
+            (
+                "workspace.create",
+                json!({"source_workspace_id":"w1"}),
+                json!({"source_workspace_id":"w4"}),
+            ),
+            (
+                "workspace.move_block",
+                json!({"workspace_ids":["w1","w9"],"before_workspace_id":"w1"}),
+                json!({"workspace_ids":["w4","w9"],"before_workspace_id":"w4"}),
+            ),
+            (
+                "pane.move",
+                json!({"pane_id":"w1:p1","destination":{"type":"tab","tab_id":"w1:t1","target_pane_id":"w1:p1","split":"right"}}),
+                json!({"pane_id":"w4:p4","destination":{"type":"tab","tab_id":"w4:t4","target_pane_id":"w4:p4","split":"right"}}),
+            ),
+            (
+                "pane.move",
+                json!({"pane_id":"w1:p1","destination":{"type":"new_tab","workspace_id":"w1"}}),
+                json!({"pane_id":"w4:p4","destination":{"type":"new_tab","workspace_id":"w4"}}),
+            ),
+            (
+                "command.invoke",
+                json!({"command_id":"opaque","pane_id":"w1:p1","selection":{"pane_id":"w1:p1","start":{"line":0,"col":0},"end":{"line":0,"col":1},"content_revision":1}}),
+                json!({"command_id":"opaque","pane_id":"w4:p4","selection":{"pane_id":"w4:p4","start":{"line":0,"col":0},"end":{"line":0,"col":1},"content_revision":1}}),
+            ),
+            (
+                "plugin.action.invoke",
+                json!({"plugin_id":"opaque","action_id":"opaque","context":{"workspace_id":"w1","tab_id":"w1:t1","focused_pane_id":"w1:p1","selection_text":"w1:p1"}}),
+                json!({"plugin_id":"opaque","action_id":"opaque","context":{"workspace_id":"w4","tab_id":"w4:t4","focused_pane_id":"w4:p4","selection_text":"w1:p1"}}),
+            ),
+        ];
+        for (method, mut params, expected) in cases {
+            aliases.request(method, &mut params).unwrap();
+            assert_eq!(params, expected, "nested method {method}");
+        }
+        for selector in [
+            "pane.output_matched",
+            "pane.agent_status_changed",
+            "pane.scroll_changed",
+        ] {
+            let mut params = json!({"subscriptions":[{"type":selector,"pane_id":"w1:p1"}]});
+            aliases.request("events.subscribe", &mut params).unwrap();
+            assert_eq!(params["subscriptions"][0]["pane_id"], "w4:p4");
+        }
+        for event in [
+            "workspace_created",
+            "workspace_updated",
+            "workspace_closed",
+            "workspace_renamed",
+            "workspace_moved",
+            "workspace_focused",
+            "tab_created",
+            "tab_closed",
+            "tab_renamed",
+            "tab_moved",
+            "tab_focused",
+            "pane_created",
+            "pane_closed",
+            "pane_focused",
+            "pane_moved",
+            "pane_output_changed",
+            "pane_exited",
+            "pane_agent_detected",
+            "pane_agent_status_changed",
+        ] {
+            let mut params = json!({"match_event":{"event":event,"pane_id":"w1:p1","tab_id":"w1:t1","workspace_id":"w1","label":"w1:p1"}});
+            aliases.request("events.wait", &mut params).unwrap();
+            assert_eq!(params["match_event"]["pane_id"], "w4:p4");
+            assert_eq!(params["match_event"]["tab_id"], "w4:t4");
+            assert_eq!(params["match_event"]["workspace_id"], "w4");
+            assert_eq!(params["match_event"]["label"], "w1:p1");
+        }
+        let mut filter = json!({"filter":{"op":"all","filters":[{"op":"any","filters":[{"op":"eq","field":"workspace_id","value":"w1"},{"op":"in","field":"tab_id","values":["w1:t1","w9:t9"]}]},{"op":"not","filter":{"op":"eq","field":"pane_id","value":"w1:p1"}},{"op":"exists","field":"pane_id"},{"op":"eq","field":{"token":"pane_id"},"value":"w1:p1"},{"op":"eq","field":"pane_id","value":{"context":"current_workspace_id"}}]}});
+        aliases.request("agent.view.set", &mut filter).unwrap();
+        assert_eq!(filter["filter"]["filters"][0]["filters"][0]["value"], "w4");
+        assert_eq!(
+            filter["filter"]["filters"][0]["filters"][1]["values"],
+            json!(["w4:t4", "w9:t9"])
+        );
+        assert_eq!(filter["filter"]["filters"][1]["filter"]["value"], "w4:p4");
+        assert_eq!(filter["filter"]["filters"][3]["value"], "w1:p1");
+        assert_eq!(
+            filter["filter"]["filters"][4]["value"],
+            json!({"context":"current_workspace_id"})
+        );
+        for method in [
+            "tab.create",
+            "tab.list",
+            "pane.swap",
+            "pane.zoom",
+            "pane.layout",
+            "pane.process_info",
+            "pane.neighbor",
+            "pane.edges",
+            "pane.focus_direction",
+            "pane.resize",
+            "pane.current",
+            "layout.export",
+            "worktree.list",
+        ] {
+            let mut omitted = json!({});
+            aliases.request(method, &mut omitted).unwrap();
+            assert_eq!(
+                omitted,
+                json!({}),
+                "omitted optionals must preserve native defaults: {method}"
+            );
+        }
+        for method in [
+            "agent.get",
+            "agent.explain",
+            "agent.focus",
+            "agent.read",
+            "agent.send_keys",
+            "agent.rename",
+            "agent.prompt",
+            "agent.wait",
+        ] {
+            let mut params = json!({"target":"w1:p1"});
+            aliases.request(method, &mut params).unwrap();
+            assert_eq!(params["target"], "w4:p4");
+            let mut name = json!({"target":"agent name w1:p1"});
+            aliases.request(method, &mut name).unwrap();
+            assert_eq!(name["target"], "agent name w1:p1");
+        }
+    }
+
+    #[test]
     fn every_intermediate_alias_maps_unless_reused_or_census_unknown() {
         use crate::holder::registry::Binding;
         let make = |n| Binding {
