@@ -1,0 +1,42 @@
+name: publish
+
+# Merging the develop -> main pull request is the release: `publish` tags
+# v{VERSION} on the merge commit and creates the GitHub release from
+# releases/v{VERSION}.md. ci.yml gated the pull request; nothing is re-tested
+# here. The release is source-only (GitHub's source archives), so there is no
+# published file to verify. No tag is pushed by hand.
+on:
+  pull_request:
+    branches: [main]
+    types: [closed]
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    name: publish
+    if: github.event.pull_request.merged == true
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Check out the merge commit with tags
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.merge_commit_sha }}
+          fetch-depth: 0
+
+      - name: Version, changelog and release note agree; the tag is new
+        run: |
+          set -euo pipefail
+          version="$(bash scripts/release-check.sh)"
+          echo "VERSION=$version" >> "$GITHUB_ENV"
+
+      - name: Tag the merge commit and publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          MERGE_SHA: ${{ github.event.pull_request.merge_commit_sha }}
+        run: |
+          gh release create "v$VERSION" --target "$MERGE_SHA" \
+            --title "herdr-shield v$VERSION" --notes-file "releases/v$VERSION.md"

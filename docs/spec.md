@@ -31,7 +31,7 @@ Out of scope: implementing Herdr changes, importing existing PTYs, checkpointing
 
 ## Evidence and eleven resolved unknowns
 
-All `S/` references mean `/tmp/herdr-shield-spec/upstream/herdr-2ecf19a92fc3a7fff75b6ce3655ef04f4625ec01/`, upstream `herdrdev/herdr` commit `2ecf19a92fc3a7fff75b6ce3655ef04f4625ec01`, tag v0.9.5. `L/` means `/tmp/herdr-shield-spec/logs/`. `R/` means `/tmp/herdr-shield-spec/spec-review/`. `D/` means `/tmp/herdr-shield-spec/dependencies/`. The research report is `/tmp/herdr-shield-spec/research.md`. These are evidence locations, never runtime defaults. Source facts essential to the build are inlined here; no prior chat or report is required to understand the design.
+All `S/` references mean the upstream `herdrdev/herdr` source tree at commit `2ecf19a92fc3a7fff75b6ce3655ef04f4625ec01`, tag v0.9.5. `L/` (logs), `R/` (spec review) and `D/` (dependencies) name the research run's private evidence directories, which this repository does not ship; its research report is not shipped either. These are evidence locations, never runtime defaults. Source facts essential to the build are inlined here; no prior chat or report is required to understand the design.
 
 ### 1. Agent authority and resume arbitration
 
@@ -423,7 +423,7 @@ Exact manifest schema: top-level `id`, `name`, `version`, `min_herdr_version`, o
 
 ```toml
 id = "herdr-shield"
-name = "herdr shield"
+name = "Herdr Shield"
 version = "0.1.0"
 min_herdr_version = "0.9.5"
 platforms = ["linux"]
@@ -480,4 +480,4 @@ Recorded probe errors, with corrected results kept separate:
 
 Historical transient-wrapper PID ledger is incomplete. All recorded primary identities were gone; the scratch-HOME process census found no residual probe processes. No source miss or failed request was treated as evidence of feature absence.
 
-All 39 recorded primary server/client/holder/dummy/service PIDs were gone at `L/049-final-cleanup.log`; its final `CENSUS_MATCH_COUNT 0` is the cleanup oracle. No live server, real agent, credentials, installed configuration, or host installation was used. The final return carries the exact recorded PID list and document-check results. Research commands, outputs, downloaded archives and prototypes remain only under `/tmp/herdr-shield-spec/`; plugin permanent output is specification documentation only.
+All 39 recorded primary server/client/holder/dummy/service PIDs were gone at `L/049-final-cleanup.log`; its final `CENSUS_MATCH_COUNT 0` is the cleanup oracle. No live server, real agent, credentials, installed configuration, or host installation was used. The final return carries the exact recorded PID list and document-check results. Research commands, outputs, downloaded archives and prototypes remain only in the research run's private evidence directories; plugin permanent output is specification documentation only.

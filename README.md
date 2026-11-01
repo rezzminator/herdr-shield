@@ -1,235 +1,204 @@
-# herdr shield
+<div align="center">
 
-## Contents
+# herdr-shield
 
-- [Requirements and limits](#requirements-and-limits)
-- [Build and manual installation](#build-and-manual-installation)
-- [Commands and rollback](#commands-and-rollback)
-- [Terminal and API support](#terminal-and-api-support)
-- [Verification](#verification)
+**Herdr plugin that keeps pane shells and coding agents alive across Herdr server crashes, in systemd user services**
 
-herdr shield v1 keeps the same shell process and its private PTY alive when the
-outer Herdr server crashes. It protects new panes started through
-`terminal.default_shell`, using a verified Linux systemd user service.
+[![CI](https://github.com/rezzminator/herdr-shield/actions/workflows/ci.yml/badge.svg)](https://github.com/rezzminator/herdr-shield/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/rezzminator/herdr-shield)](https://github.com/rezzminator/herdr-shield/releases)
+[![License: MIT](https://img.shields.io/badge/license-MIT-green)](./LICENSE)
+[![Platform: Linux](https://img.shields.io/badge/platform-Linux%20%2B%20systemd-lightgrey)](#requirements)
+[![Herdr 0.9.5](https://img.shields.io/badge/Herdr-0.9.5-blue)](https://github.com/herdrdev/herdr)
 
-Explicit layout commands, plugin panes, custom commands, popups, replacements
-outside the default-shell route, and panes already running at installation are
-**UNPROTECTED**. `herdr-shield list --json` and the plugin list action include every
-enumerated pane, its reason, the complete launch-door coverage table, holders,
-and orphan cleanup commands. Unknown provenance is UNPROTECTED. Failed pane
-enumeration is ERROR, not an empty successful list. An authenticated, read-only
-child census also reports PTYs hidden from public pane enumeration, such as
-popup and overlay terminals, with `pane_id: null`, their exact boot/start
-process identity, and an explicit UNPROTECTED reason. The census reports its
-observed count and OK or ERROR status. It is not a kill capability.
+[Install](#install) · [Usage](#usage) · [How it works](#how-it-works) · [What is not protected](#what-is-not-protected) · [Changelog](./CHANGELOG.md)
 
-The 27 active v1 acceptance rows have watched passing coverage. Rows 1 and 4
-require an upstream facility and are v2, outside the v1 gate. The pinned
-integration target is Herdr 0.9.5, protocol 22, commit
-`2ecf19a92fc3a7fff75b6ce3655ef04f4625ec01`.
+</div>
 
-## Requirements and limits
+When the [Herdr](https://github.com/herdrdev/herdr) server crashes, is killed or restarts, every pane's shell dies with it, and so does the agent, build or REPL running inside. herdr-shield moves each new pane's shell into a holder, a systemd user service that owns the pane's terminal, so the shell outlives Herdr. When Herdr is back, you reattach to the same process, with its memory and screen intact.
 
-Linux, an available systemd user manager, and positive verification that each
-holder's cgroup belongs to its transient service outside any login session
-scope are required. Failed launch or verification prints UNPROTECTED and runs
-the explicitly configured plain shell. On unsupported platforms, the entrypoint
-prints a clear refusal and execs that configured shell; it does not use a
-`setsid` fallback. `src/shell.rs` is the shared configuration/process façade,
-and `src/unsupported.rs` implements this unsupported-platform path. There is no
-detachment-backend fallback.
-Logout, user-manager shutdown and reboot can still end workloads. herdr shield
-does not enable linger or change system services.
+```text
+# in a protected pane
+$ X=kept-in-shell-memory; echo BEFORE-$$-$X
+BEFORE-2376013-kept-in-shell-memory
 
-Native agent resume must be disabled **for the entire Herdr session**, including
-unprotected panes. Otherwise Herdr can inject a duplicate command into an
-already reattached living shell. Native agent discovery sees the outer attach
-process, not the inner process; native `agent.start` busy/errors remain visible.
+# the Herdr server is killed with SIGKILL and started again;
+# herdr-shield list --json still shows the holder, now an orphan:
+#   "id": "666c3429c22a5644779ec33ba34aee20", "state": "running", "orphan": true,
+#   "cleanup": "herdr-shield kill 666c3429c22a5644779ec33ba34aee20"
 
-No automatic recovery command executes after holder loss. The private recovery
-screen shows the holder ID, known reason and exact captured argv as a JSON
-array. Enter is offered only with independent process-death proof; any other
-key selects a plain shell. Reporting helper PIDs do not establish the agent's
-identity, so their reports alone never enable resume. Capture also requires a
-changed persisted upstream resume slot and a fresh report epoch. The foreground
-process root must be validated through ancestry, cgroup, boot/start identity and
-executable provenance. Missing or untrusted snapshot or provenance evidence
-suppresses fallback.
+# in the restored pane
+$ herdr-shield attach 666c3429c22a5644779ec33ba34aee20
+BEFORE-2376013-kept-in-shell-memory
+$ echo AFTER-$$-$X
+AFTER-2376013-kept-in-shell-memory
+```
 
-EOF, SIGHUP, hook hints and failed/empty enumeration retain holders. Only a
-completed authenticated, generation-matching explicit close observed through
-the holder relay or its authenticated live observer can authorize automatic
-termination. A close without sufficient provenance leaves an orphan for explicit
-cleanup. Private credentials prevent accidental cross-binding, but do not
-sandbox against another malicious process running as the same user.
+Same PID, same shell variable, same screen: the shell never noticed the crash.
 
-## Build and manual installation
+## Why herdr-shield
 
-From a release tarball or source tree with Rust 1.99.0:
+- **Your process survives, not a copy of it.** Snapshot plugins such as [herdr-resurrect](https://github.com/ntindle/herdr-resurrect) record a layout and start programs again after a crash; herdr-shield keeps the original process running, so nothing is relaunched and nothing in memory is lost.
+- **It never kills on a guess.** A holder ends only when Herdr closes that exact pane and herdr-shield authenticates the close. A crash, a missing socket, an EOF or an empty pane list keeps the holder.
+- **It tells you what is not protected.** Every pane is reported PROTECTED or UNPROTECTED with the reason, and every orphaned holder comes with its exact cleanup command.
+- **It never reruns a command for you.** If a holder is lost, a recovery screen shows the captured command; Enter reruns it only after the original process is proven gone.
+- **It fails safe.** Where a holder cannot be verified, herdr-shield prints UNPROTECTED with the reason and opens your configured plain shell.
+
+## Requirements
+
+> [!IMPORTANT]
+> herdr-shield runs on **Linux only**, with a running **systemd user manager**: every protected shell lives in a transient systemd user service, and herdr-shield verifies that the service's cgroup sits outside your login session. On macOS, the BSDs and Windows it prints UNPROTECTED and opens your plain shell.
+
+- Herdr 0.9.5, integration protocol 22, the release it is tested against; `herdr-shield doctor` refuses any other protocol.
+- Rust through [rustup](https://rustup.rs): `rustup toolchain install` in the checkout installs the toolchain pinned in `rust-toolchain.toml`.
+- Two Herdr settings herdr-shield cannot set for you: `shell_mode = "non_login"`, and native agent resume off for the **whole** session (`resume_agents_on_restore = false`), unprotected panes included; otherwise Herdr can type a duplicate command into a shell that is still running.
+
+## Install
+
+Releases are source only. Clone and build:
 
 ```sh
+git clone https://github.com/rezzminator/herdr-shield.git
+cd herdr-shield
+rustup toolchain install
 cargo build --release --locked
 mkdir -p bin
 cp target/release/herdr-shield bin/herdr-shield
 ```
 
-Choose a permanent, versioned executable destination under your own install
-root. Keep old compatible executable copies while holders reference them.
-Point a stable executable path at your selected version only after checking its
-wire compatibility. Never kill/recreate living holders merely for an upgrade.
-An incompatible major reports the exact compatible-client path.
-
-Create a private configuration directory `herdr-shield` below `XDG_CONFIG_HOME`
-(default: your home configuration directory), mode 0700. Create `config.json`,
-mode 0600, with your explicitly chosen real shell and arguments:
-
-```json
-{"shell":"<absolute executable path of your real shell>","args":[]}
-```
-
-The shell must be executable and cannot be this binary, a symlink to it or a
-recursive attach. Inner login/startup behavior is entirely your chosen argv;
-Herdr's outer shell mode does not decide it. Ordinary user environment is
-transferred privately in memory; the holder replaces Herdr binding variables
-with its private API relay and birth identities. No environment snapshot is
-written to metadata or logs.
-
-Register the plugin explicitly:
+Pick the shell herdr-shield runs inside each holder. It must be a real shell executable, never herdr-shield itself; its arguments decide login and startup behaviour:
 
 ```sh
-herdr plugin link <absolute-plugin-root>
-herdr plugin list
+dir="${XDG_CONFIG_HOME:-$HOME/.config}/herdr-shield"
+mkdir -p -m 0700 "$dir"
+printf '{"shell":"%s","args":[]}\n' "$(command -v bash)" > "$dir/config.json"
+chmod 0600 "$dir/config.json"
 ```
 
-Make these explicit manual edits to your Herdr configuration:
+Link the plugin, then print the absolute path Herdr's default shell will use:
+
+```sh
+herdr plugin link "$PWD"
+herdr plugin list
+echo "$PWD/bin/herdr-shield"
+```
+
+Edit Herdr's configuration (`${XDG_CONFIG_HOME:-$HOME/.config}/herdr/config.toml`) by hand:
 
 ```toml
 [terminal]
-default_shell = "<absolute installed herdr-shield executable>"
+default_shell = "/absolute/path/to/herdr-shield/bin/herdr-shield"
 shell_mode = "non_login"
 
 [session]
 resume_agents_on_restore = false
 ```
 
-Plugin registration cannot set these values. Restart/reload Herdr using its
-documented procedure, deliberately end existing workloads before replacing
-their panes, then inspect `herdr-shield doctor` and `herdr-shield list --json`.
-Normal startup never installs itself or modifies host configuration.
+Restart the Herdr server so new panes start through herdr-shield, then check:
 
-## Commands and rollback
+```sh
+herdr-shield doctor
+herdr-shield list --json
+```
 
-`herdr-shield` attaches or creates the default-shell pane's holder.
-`attach <holder-id>` only attaches an existing holder. One attachment owns input;
-a competing attachment is refused without taking over. `reconcile` is
-idempotent and never treats absence as intent. `list [--json]` prints full
-coverage; the manifest action records that same output in the plugin log and
-posts a short notification. Inspect it with
-`herdr plugin log list --plugin herdr-shield`.
+`doctor` prints a line starting `OK: Linux/systemd user manager` when everything is in place. Panes that were already running are not adopted: end their work deliberately and open new panes. Neither the build nor herdr-shield changes your Herdr or systemd configuration by itself.
 
-`kill <holder-id>` requires an interactive full-ID confirmation. Automated
-cleanup must explicitly pass `--confirm <the-same-exact-id>`; piped input is not
-consent. The private holder capability and exact child identity are checked
-before signalling. There is no destructive manifest action.
+## Usage
 
-To roll back, restore your original `terminal.default_shell`, remove the plugin
-link through Herdr, and leave running holders and their compatible executable
-copies in place. Attach them directly or explicitly drain/kill each exact ID.
-Removing a plugin link does not adopt, resume or terminate their workloads.
+Run in a protected pane, or in any terminal with access to the same Herdr server:
 
-## Terminal and API support
-
-Alacritty owns the inner terminal model and all DA/DSR/color/size replies,
-including while detached. The renderer emits bounded full-screen snapshots
-with sequence/checksum verification; scrollback remains bounded and in memory.
-PTY input/resize require the current lease, generation and increasing sequence.
-
-| Feature | Implementation / verification boundary |
+| Command | What it does |
 | --- | --- |
-| CR/LF, erase/insert, Unicode/wide/combining, scrolling, alternate screen | Alacritty model; fixed cell/redraw corpus |
-| SGR default/indexed/truecolor, cursor, app cursor/keypad, paste/mouse/focus modes | Controlled renderer and mode restore; mouse protocol bytes are tested, physical mouse hardware is not |
-| DA/DSR, color, text size queries split over bytes | Exactly one inner responder; queries never replayed to Herdr |
-| Clipboard OSC 52 | Reads never forwarded; a valid base64 write of at most 64 KiB, made while a client is attached, reaches Herdr, whose own policy applies; a write made while detached is never replayed |
-| Unknown/private OSC/DCS | Model ignores unsupported sequences; no raw forwarding |
-| OSC 7 / OSC 133 / title sideband | Bounded, audited cwd, A/B/C/D command markers and title metadata; reconnect restores only the latest cwd/title, never historic commands |
-| OSC 8 hyperlinks and advanced underline styles/colors | Rendered by the terminal model and covered by fixed protocol tests |
-| Attachment color probes | Validated current-attachment replies merge with retained/default palette; policy is visible in status and list |
+| `herdr-shield attach <holder-id>` | Reconnect a living holder and redraw its screen. One attachment owns input at a time; a second one is refused. |
+| `herdr-shield list --json` | Every pane with PROTECTED or UNPROTECTED and the reason, the coverage of each pane launch route, every holder, and each orphan's cleanup command. A failed enumeration prints ERROR, never an empty list. |
+| `herdr-shield doctor` | Check the platform, the systemd user manager, the configuration, native resume being off, Herdr's protocol and the holder registry. Changes nothing. |
+| `herdr-shield kill <holder-id>` | End one exact holder after you type its full ID. Scripts pass `--confirm <the-same-id>`; piped input is never consent. |
+| `herdr-shield reconcile` | Re-run the coverage check Herdr runs at plugin startup. Never treats a missing pane as a close. |
+| `herdr-shield --help` | The full command list. |
 
-Ordinary input and terminal query replies use independent bounded queues. If a
-child does not consume stdin and the reply queue fills, the holder continues
-draining PTY output and exposes `terminal.query_error`.
+From Herdr, the plugin's `list` action records the same report in the plugin log:
 
-The holder does not hang, report successful delivery, automatically kill the
-process, or grow memory without bound. Finite in-scope query floods are
-delivered exactly once.
+```sh
+herdr plugin action invoke list --plugin herdr-shield
+herdr plugin log list --plugin herdr-shield
+```
 
-The API relay uses vendored typed protocol-22 schemas and one exhaustive policy
-for all 102 methods. Server administration, plugin/integration installation,
-binary transport and untyped `agent.explain` are refused explicitly. Native
-errors pass through unchanged. Typed old identity aliases map on input; opaque
-text, argv, paths, tokens and agent names are never globally rewritten.
-Results remain canonical current identities. Binding changes interrupt streams
-with a stale-generation error so callers can resubscribe.
+### After a Herdr crash or restart
 
-Observed pane moves update the current binding. Binding history keeps each
-distinct pane/tab/workspace ID triple once, so rebinding to known IDs never
-grows it; it is capped at 256 triples, and the plugin explicitly refuses new
-history at the cap. Historical aliases
-are refused when live/reused or when the census is unknown. Stock Herdr supplies
-no durable pane-instance token across deleted and recreated sessions, so cold
-automatic restore will not rebind: it retains the orphan, opens a plain shell,
-and marks the replacement UNPROTECTED. `herdr-shield attach <id>` deliberately
-selects and reconnects a living holder. A live handoff can rebind automatically
-only while the original attachment PID/boot/start identity is live and Herdr's
-shell_pid independently matches.
+1. Holders keep running. On a cold restart, Herdr's restored panes cannot prove which old process they belong to, so each holder is kept as an orphan and the restored pane opens a plain shell marked UNPROTECTED.
+2. `herdr-shield list --json` shows each orphan's `id`.
+3. In the pane where you want it, run `herdr-shield attach <id>`.
 
-The tested upgrade path runs distinct compatible old and new executables
-side-by-side: the new client can attach to the old holder, and an incompatible
-major version reports the preserved compatible-client path without disturbing
-the holder. Tests for non-Linux behavior exercise the unsupported entrypoint
-simulation and compile-time module selection; no actual non-Linux host was
-tested. These results do not guarantee logout, reboot, cross-version Herdr
-installer handoff, or physical mouse behavior.
+A Herdr live handoff (`server.live_handoff`) rebinds holders automatically, as long as the original attachment and Herdr's reported shell process both still match.
+
+## How it works
+
+```mermaid
+flowchart LR
+    H["Herdr server"] -->|pane runs default_shell| A["herdr-shield<br/>attach client"]
+    A -->|private Unix socket| S["holder<br/>systemd user service"]
+    S -->|owns the PTY| P["your shell<br/>and its children"]
+    P -.->|Herdr API calls| R["holder's API relay<br/>protocol 22"]
+    R --> H
+```
+
+- The holder runs as `herdr-shield-{holder-id}.service` under your systemd user manager, outside Herdr's process tree and your login session scope, so the Herdr server can die without taking it along.
+- The holder keeps its own terminal model (Alacritty's). It answers every terminal query, even with no client attached, and sends a full redraw on reattach. Scrollback stays bounded and in memory.
+- Programs in the shell reach Herdr's API through the holder's relay, which knows each of protocol 22's 102 methods: it refuses server administration, plugin installation, binary transport and untyped `agent.explain` visibly, passes native errors through unchanged, and maps pane, tab and workspace IDs to the current binding.
+- Configuration, holder records and sockets are private to your user (directories 0700, files 0600). Your environment is passed to the holder in memory and never written to disk or logs.
+
+<details>
+<summary>Terminal feature support</summary>
+
+| Feature | Behaviour |
+| --- | --- |
+| CR/LF, erase/insert, Unicode/wide/combining, scrolling, alternate screen | Alacritty model; fixed cell and redraw tests |
+| SGR default/indexed/truecolor, cursor, app cursor/keypad, paste/mouse/focus modes | Rendered and restored on reattach; mouse protocol bytes are tested, physical mouse hardware is not |
+| Device attribute, status, colour and size queries, even split across reads | Answered once, by the holder; never replayed to Herdr |
+| Clipboard (OSC 52) | Reads never forwarded; a valid base64 write of at most 64 KiB, made while a client is attached, reaches Herdr, whose own policy applies; a write made while detached is never replayed |
+| Unknown or private OSC/DCS | Ignored by the model; never forwarded raw |
+| Working directory (OSC 7), prompt marks (OSC 133), title | Bounded and audited; a reattach restores the latest directory and title, never past commands |
+| Hyperlinks (OSC 8), underline styles and colours | Rendered by the model; fixed protocol tests |
+| Colour probes from the attaching terminal | Validated replies merge with the retained or default palette |
+
+Typed input and terminal query replies use separate bounded queues: a program that stops reading its input cannot make the holder hang or grow without bound; the holder keeps draining output and shows `terminal.query_error` in `list`. When no program has set a cursor shape, your terminal's default cursor is restored.
+
+</details>
+
+## What is not protected
+
+- **Panes not started through `terminal.default_shell`:** layouts with an explicit command, plugin panes, custom commands, popups, replacements outside the default-shell route, and panes already running at installation. They are reported UNPROTECTED, with the reason. A read-only census also lists terminals Herdr does not show as panes, such as popups and overlays.
+- **Logout, a stop of the systemd user manager, reboot.** These end holders. herdr-shield does not enable linger or touch system services.
+- **Automatic rebinding after a cold restart.** Stock Herdr has no durable pane identity across a restart; reattach deliberately with `herdr-shield attach <id>`. Protecting every pane, and rebinding automatically, need an upstream Herdr facility, drafted in [docs/upstream-issue.md](./docs/upstream-issue.md).
+- **A hostile process running as your user.** Private sockets and capabilities prevent accidental cross-binding; they are not a sandbox.
+
+Native agent discovery in Herdr sees the attach client, not the process inside the holder; native `agent.start` busy states and errors stay visible.
+
+## Upgrade and uninstall
+
+Each holder keeps running the executable it started from, so install each version in its own directory and keep an old one while its holders live; never kill holders just to upgrade. A newer client attaches to an older compatible holder; an incompatible major version prints the path of the compatible client.
+
+To uninstall, restore your previous `terminal.default_shell`, run `herdr plugin unlink herdr-shield`, and leave running holders alone: attach to each with its old executable, or end it with `herdr-shield kill <holder-id>`. Unlinking does not adopt, resume or end any workload.
 
 ## Verification
 
-Run builds and tests with HOME, all XDG roots, CARGO_HOME, CARGO_TARGET_DIR and
-TMPDIR inside an explicit throwaway test root. Set `HERDR_SHIELD_TEST_ROOT` to a
-fresh subdirectory of TMPDIR for the black-box Rust tests. They require a real
-systemd user manager and use only `herdr-shield-test-` services. Missing tools,
-refused backends and skipped tests are errors, never passing suites.
+`make check` runs the whole gate in one throwaway root under `/tmp` that holds `HOME`, every XDG directory, `TMPDIR`, `CARGO_HOME` and `CARGO_TARGET_DIR`:
 
 ```sh
-export HERDR_SHIELD_BUILD_ROOT="$(mktemp -d /tmp/hk.XXXXXX)"
-export TMPDIR="$HERDR_SHIELD_BUILD_ROOT"
-export HOME="$HERDR_SHIELD_BUILD_ROOT/home"
-export XDG_CONFIG_HOME="$HERDR_SHIELD_BUILD_ROOT/xdg-config"
-export XDG_CACHE_HOME="$HERDR_SHIELD_BUILD_ROOT/xdg-cache"
-export XDG_DATA_HOME="$HERDR_SHIELD_BUILD_ROOT/xdg-data"
-export XDG_STATE_HOME="$HERDR_SHIELD_BUILD_ROOT/xdg-state"
-export XDG_RUNTIME_DIR="$HERDR_SHIELD_BUILD_ROOT/xdg-runtime"
-export CARGO_HOME="$HERDR_SHIELD_BUILD_ROOT/cargo-home"
-export CARGO_TARGET_DIR="$HERDR_SHIELD_BUILD_ROOT/cargo-target"
-export HERDR_SHIELD_TEST_ROOT="$HERDR_SHIELD_BUILD_ROOT/tests"
-export HERDR_SHIELD_BIN="$CARGO_TARGET_DIR/debug/herdr-shield"
-export HERDR_SHIELD_OLD_BIN="${HERDR_SHIELD_OLD_BIN:?}"
-export HERDR_BIN="${HERDR_BIN:?set pinned Herdr 0.9.5 binary}"
-mkdir -p "$TMPDIR" "$HOME" "$XDG_CONFIG_HOME" "$XDG_CACHE_HOME" \
-  "$XDG_DATA_HOME" "$XDG_STATE_HOME" "$CARGO_HOME" "$CARGO_TARGET_DIR" \
-  "$HERDR_SHIELD_TEST_ROOT"
-mkdir -m 700 -p "$XDG_RUNTIME_DIR"
-
-cargo fmt --all -- --check
-cargo clippy --all-targets --all-features -- -D warnings
-cargo test --all-targets --all-features
-bash scripts/checks.sh
-bash scripts/test-herdr.sh --herdr "$HERDR_BIN"
+make check
 ```
 
-The black-box process tests also require `HERDR_SHIELD_OLD_BIN`, a preserved
-compatible prior executable, to verify real old/new coexistence. Run every test
-with HOME and all XDG roots under the isolated test root and a verified
-throwaway Herdr socket. The real-Herdr jail validates its socket before every
-command, records exact owned process identities, uses dummy agents, and
-stops/resets only its uniquely named test services. Fault tests clean their
-resources even on failure. Upstream schema attribution is in `LICENSE-HERDR`.
+It downloads the Herdr release pinned in `pins.env`, verifies its SHA-256, and runs `cargo fmt`, `cargo clippy -D warnings`, a release build, `cargo test --all-targets --all-features`, the structural checks and the real-Herdr tests. It needs Linux on x86_64, a running systemd user manager, rustup, curl and `/usr/bin/python3`. The tests start their own Herdr servers on owned sockets, use only `herdr-shield-test-` services and dummy workloads, and clean up even on failure. On success the root is removed; on failure its path is printed. A missing tool or a skipped test fails the run. CI runs `make check` on `ubuntu-latest` only: holders are systemd user services, so there is no macOS leg.
+
+`make release` checks that `Cargo.toml`, `herdr-plugin.toml`, the `CHANGELOG.md` section and `releases/v{version}.md` agree on the version, and that its tag does not exist yet.
+
+The acceptance contract behind these tests, with every promise numbered, is [docs/spec.md](./docs/spec.md). Non-Linux behaviour is tested by simulating the unsupported entry point; no non-Linux host was run.
+
+## Help and contributing
+
+- Questions and bugs: [SUPPORT.md](./SUPPORT.md) and the [issue templates](https://github.com/rezzminator/herdr-shield/issues/new/choose).
+- Security problems: [SECURITY.md](./SECURITY.md), never a public issue.
+- Changes: [CONTRIBUTING.md](./CONTRIBUTING.md); a place to start is a [good first issue](https://github.com/rezzminator/herdr-shield/issues?q=is%3Aissue+is%3Aopen+label%3A%22good+first+issue%22).
+
+## License
+
+[MIT](./LICENSE). The vendored Herdr protocol schemas are Apache-2.0; see [LICENSE-HERDR](./LICENSE-HERDR).

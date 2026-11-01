@@ -36,11 +36,14 @@ pub fn connect(path: &Path) -> Result<UnixStream> {
     if !path.is_absolute() {
         return fail("Herdr endpoint must be absolute");
     }
-    let meta = std::fs::symlink_metadata(path)?;
+    let unreachable = |error: std::io::Error| {
+        format!("Herdr server not reachable at {}: {error}", path.display())
+    };
+    let meta = std::fs::symlink_metadata(path).map_err(unreachable)?;
     if meta.file_type().is_symlink() {
         return fail("symlinked Herdr endpoint refused");
     }
-    let stream = UnixStream::connect(path)?;
+    let stream = UnixStream::connect(path).map_err(unreachable)?;
     protocol::peer(&stream)?;
     stream.set_read_timeout(Some(Duration::from_secs(5)))?;
     stream.set_write_timeout(Some(Duration::from_secs(5)))?;

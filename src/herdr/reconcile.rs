@@ -298,7 +298,7 @@ pub fn list(paths: &Paths, action: bool) -> Result<()> {
         super::rpc(
             &socket,
             "notification.show",
-            json!({"title":"herdr shield coverage","body":message}),
+            json!({"title":"Herdr Shield coverage","body":message}),
         )?;
     }
     if report["enumeration"] == "ERROR" {

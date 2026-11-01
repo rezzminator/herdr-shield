@@ -108,7 +108,8 @@ def census(jail):
     assert next(p for p in report(jail)['panes'] if p['pane_id'] == preexisting)['status'] == 'UNPROTECTED'
     # Every bypass gets a separate dummy PID oracle and a visible reason on both surfaces.
     door = jail.root / 'door-shell'
-    door.write_text('#!/bin/sh\nprintf "%s" "$$" > "$HOME/door-$1.pid"\nexec /bin/sleep 600\n')
+    # Written then renamed, so a reader never sees the created-but-empty marker.
+    door.write_text('#!/bin/sh\nprintf "%s" "$$" > "$HOME/door-$1.pid.tmp"\nmv "$HOME/door-$1.pid.tmp" "$HOME/door-$1.pid"\nexec /bin/sleep 600\n')
     door.chmod(0o700)
 
     def unprotected(pid, pane_id=None):

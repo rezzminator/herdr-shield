@@ -12,7 +12,7 @@ import struct
 from unittest.mock import patch
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
-from real import Jail, identity, live, wait
+from real import PINS, Jail, identity, live, wait
 
 
 def main():
@@ -62,7 +62,7 @@ def main():
         owned = jail.server()
         # Failed handoff adoption is a hard error after recorded resources are cleaned.
         jail.handoff_pending = True
-        jail.api('server.live_handoff', {'import_exe': jail.herdr, 'expected_protocol': 22, 'expected_version': '0.9.5'})
+        jail.api('server.live_handoff', {'import_exe': jail.herdr, 'expected_protocol': 22, 'expected_version': PINS['HERDR_VERSION']})
         wait(lambda: owned.poll() is not None)
         if receipt := os.environ.get('HERDR_SHIELD_HANDOFF_FAILURE_RECEIPT'):
             jail.guard()
