@@ -29,7 +29,9 @@ if mode == 'queries':
     while time.monotonic() < deadline:
         if select.select([0], [], [], 0.1)[0]:
             data.extend(os.read(0, 65536))
-    (root / 'query-replies').write_bytes(data)
+    # Rename publishes the reply file whole: the reader waits only for it to exist.
+    (root / 'query-replies.tmp').write_bytes(data)
+    (root / 'query-replies.tmp').rename(root / 'query-replies')
 elif mode == 'flood':
     os.write(1, b'FLOOD_READY')
     while not (root / 'flood-go').exists():

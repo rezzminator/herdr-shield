@@ -24,6 +24,16 @@ def json_object(text):
     return value if isinstance(value, dict) else None
 
 
+def manage_unit(action, unit, *args):
+    """A test unit's systemctl action on the user manager's own bus, never the isolated
+    XDG_RUNTIME_DIR, which holds no bus; the completed process carries exit code and stderr."""
+    assert unit.startswith('herdr-shield-test-') and unit.endswith('.service'), unit
+    bus = f'unix:path=/run/user/{os.getuid()}/bus'
+    return subprocess.run(['systemctl', '--user', f'--machine={os.getuid()}@.host', action, *args, unit],
+                          env=dict(os.environ, DBUS_SESSION_BUS_ADDRESS=bus), stdout=subprocess.PIPE,
+                          stderr=subprocess.PIPE, text=True, timeout=15, check=False)
+
+
 def cleanup(root):
     records = []
     ledger = root / 'owned-resources.jsonl'
@@ -51,17 +61,17 @@ def cleanup(root):
         assert unit == 'herdr-shield-test-' + holder_id + '.service'
         units.add(unit)
         identities.extend(record[key] for key in ('holder', 'child') if record.get(key))
+    results = []
     for unit in sorted(units):
         for action in ('stop', 'reset-failed'):
-            subprocess.run(['systemctl', '--user', f'--machine={os.getuid()}@.host', action, unit],
-                           stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=15, check=False)
-        print('CLEANUP gate unit', unit, flush=True)
-        status = subprocess.run(['systemctl', '--user', f'--machine={os.getuid()}@.host', 'show',
-                                 '--property=ActiveState', '--value', unit],
-                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=15)
-        assert status.stdout.strip() not in ('active', 'activating', 'deactivating'), ('ERROR gate unit survived', unit)
+            results.append(manage_unit(action, unit))
+        print('CLEANUP gate unit', results[-2:], flush=True)
+        status = manage_unit('show', unit, '--property=ActiveState', '--value')
+        # A manager we cannot reach must never read as an inactive unit.
+        assert status.returncode == 0, ('ERROR gate cannot read unit state', status, results)
+        assert status.stdout.strip() not in ('active', 'activating', 'deactivating'), ('ERROR gate unit survived', status, results)
     survivors = [record['pid'] for record in identities if live(record)]
-    assert not survivors, ('ERROR gate process survivors', survivors)
+    assert not survivors, ('ERROR gate process survivors', survivors, results)
     for path in root.rglob('*.sock'):
         assert path.is_relative_to(root) and not path.is_symlink() and path.is_socket()
         with socket.socket(socket.AF_UNIX) as connection:

@@ -558,18 +558,9 @@ fn corrupt_registry_assertion_failure_still_cleans_owned_resources() {
     }
     // A broken cleanup control must itself clean its independently recorded exact unit before failing.
     let unit = meta["unit"].as_str().unwrap();
-    assert!(unit.starts_with("herdr-shield-test-") && unit.ends_with(".service"));
-    for action in ["stop", "reset-failed"] {
-        let _ = std::process::Command::new("systemctl")
-            .args([
-                "--user",
-                &format!("--machine={}@.host", nix::unistd::Uid::current()),
-                action,
-                unit,
-            ])
-            .output()
-            .unwrap();
-    }
+    let cleanup: Vec<_> = ["stop", "reset-failed"]
+        .map(|action| jail::manage_unit(action, unit))
+        .to_vec();
     let root = std::path::Path::new(record["root"].as_str().unwrap());
     assert!(root.starts_with(std::env::temp_dir()));
     for name in ["holder.sock", "herdr-api.sock"] {
@@ -578,7 +569,11 @@ fn corrupt_registry_assertion_failure_still_cleans_owned_resources() {
             .join(meta["id"].as_str().unwrap())
             .join(name);
         if socket.exists() {
-            assert!(UnixStream::connect(&socket).is_err());
+            assert!(
+                UnixStream::connect(&socket).is_err(),
+                "live socket {} after cleanup {cleanup:?}",
+                socket.display()
+            );
             fs::remove_file(socket).unwrap();
         }
     }
@@ -650,25 +645,9 @@ fn gate_timeout_cleans_owned_resources() {
                 }
             }
             let unit = meta["unit"].as_str().unwrap();
-            assert!(unit.starts_with("herdr-shield-test-") && unit.ends_with(".service"));
-            let _ = std::process::Command::new("systemctl")
-                .args([
-                    "--user",
-                    &format!("--machine={}@.host", nix::unistd::Uid::current()),
-                    "stop",
-                    unit,
-                ])
-                .output()
-                .unwrap();
-            let _ = std::process::Command::new("systemctl")
-                .args([
-                    "--user",
-                    &format!("--machine={}@.host", nix::unistd::Uid::current()),
-                    "reset-failed",
-                    unit,
-                ])
-                .output()
-                .unwrap();
+            let cleanup: Vec<_> = ["stop", "reset-failed"]
+                .map(|action| jail::manage_unit(action, unit))
+                .to_vec();
             for name in ["holder.sock", "herdr-api.sock"] {
                 let socket = path
                     .join("run/herdr-shield")
@@ -676,7 +655,13 @@ fn gate_timeout_cleans_owned_resources() {
                     .join(name);
                 if socket.exists() {
                     socket_survivors.push(socket.clone());
-                    assert!(UnixStream::connect(&socket).is_err());
+                    assert!(
+                        UnixStream::connect(&socket).is_err(),
+                        "live socket {} after cleanup {cleanup:?}; gate stdout:\n{}\ngate stderr:\n{}",
+                        socket.display(),
+                        String::from_utf8_lossy(&output.stdout),
+                        String::from_utf8_lossy(&output.stderr)
+                    );
                     fs::remove_file(socket).unwrap();
                 }
             }
@@ -684,13 +669,20 @@ fn gate_timeout_cleans_owned_resources() {
         let socket = path.join("mock.sock");
         if socket.exists() {
             socket_survivors.push(socket.clone());
-            assert!(UnixStream::connect(&socket).is_err());
+            assert!(
+                UnixStream::connect(&socket).is_err(),
+                "live socket {}; gate stdout:\n{}\ngate stderr:\n{}",
+                socket.display(),
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
             fs::remove_file(socket).unwrap();
         }
     }
     assert!(
         output.status.success(),
-        "{}",
+        "gate stdout:\n{}\ngate stderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(

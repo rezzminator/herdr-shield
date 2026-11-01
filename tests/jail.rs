@@ -184,6 +184,29 @@ pub fn wait(mut predicate: impl FnMut() -> bool) {
     panic!("ERROR: predicate timeout");
 }
 
+/// The one door for a test unit's `systemctl` action: the user manager's own bus, never the
+/// isolated XDG_RUNTIME_DIR, which holds no bus; returns the action, unit, exit status and stderr.
+pub fn manage_unit(action: &str, unit: &str) -> String {
+    assert!(
+        unit.starts_with("herdr-shield-test-") && unit.ends_with(".service"),
+        "ERROR: not a test unit: {unit}"
+    );
+    let uid = nix::unistd::Uid::current();
+    let output = Command::new("systemctl")
+        .args(["--user", &format!("--machine={uid}@.host"), action, unit])
+        .env(
+            "DBUS_SESSION_BUS_ADDRESS",
+            format!("unix:path=/run/user/{uid}/bus"),
+        )
+        .output()
+        .unwrap();
+    format!(
+        "{action} {unit}: {} {}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr).trim()
+    )
+}
+
 impl Drop for Jail {
     fn drop(&mut self) {
         let mut identities = Vec::new();
@@ -221,19 +244,8 @@ impl Drop for Jail {
                 .as_str()
                 .filter(|unit| unit.starts_with("herdr-shield-test-") && unit.ends_with(".service"))
             {
-                let bus = format!("unix:path=/run/user/{}/bus", nix::unistd::Uid::current());
                 for action in ["stop", "reset-failed"] {
-                    let output = Command::new("systemctl")
-                        .args([
-                            "--user",
-                            &format!("--machine={}@.host", nix::unistd::Uid::current()),
-                            action,
-                            unit,
-                        ])
-                        .env("DBUS_SESSION_BUS_ADDRESS", &bus)
-                        .output()
-                        .unwrap();
-                    println!("CLEANUP unit {unit}: {action} {}", output.status);
+                    println!("CLEANUP unit {}", manage_unit(action, unit));
                 }
             }
         }
