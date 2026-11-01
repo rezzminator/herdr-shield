@@ -149,7 +149,7 @@ PTY input/resize require the current lease, generation and increasing sequence.
 | CR/LF, erase/insert, Unicode/wide/combining, scrolling, alternate screen | Alacritty model; fixed cell/redraw corpus |
 | SGR default/indexed/truecolor, cursor, app cursor/keypad, paste/mouse/focus modes | Controlled renderer and mode restore; mouse protocol bytes are tested, physical mouse hardware is not |
 | DA/DSR, color, text size queries split over bytes | Exactly one inner responder; queries never replayed to Herdr |
-| Clipboard OSC 52 | Disabled for reads and writes |
+| Clipboard OSC 52 | Reads never forwarded; a valid base64 write of at most 64 KiB, made while a client is attached, reaches Herdr, whose own policy applies; a write made while detached is never replayed |
 | Unknown/private OSC/DCS | Model ignores unsupported sequences; no raw forwarding |
 | OSC 7 / OSC 133 / title sideband | Bounded, audited cwd, A/B/C/D command markers and title metadata; reconnect restores only the latest cwd/title, never historic commands |
 | OSC 8 hyperlinks and advanced underline styles/colors | Rendered by the terminal model and covered by fixed protocol tests |

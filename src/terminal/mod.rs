@@ -40,6 +40,10 @@ impl Dimensions for Size {
     }
 }
 
+/// The emulator's default cursor shape, one DECSCUSR cannot select: a cursor
+/// showing it is one the app never styled (alacritty keeps that state private).
+pub const UNSET_CURSOR: ansi::CursorShape = ansi::CursorShape::HollowBlock;
+
 pub struct Terminal {
     pub term: Term<Events>,
     processor: ansi::Processor,
@@ -60,6 +64,10 @@ impl Terminal {
             scrolling_history: 1000,
             osc52: Osc52::Disabled,
             kitty_keyboard: true,
+            default_cursor_style: ansi::CursorStyle {
+                shape: UNSET_CURSOR,
+                blinking: false,
+            },
             ..Config::default()
         };
         Self {

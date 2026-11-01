@@ -151,11 +151,15 @@ pub fn screen(
     }
     let _ = write!(out, "\x1b[={keyboard}u");
     let cursor = term.renderable_content().cursor;
-    let shape = match cursor.shape {
-        CursorShape::Beam => 6,
-        CursorShape::Underline => 4,
-        _ => 2,
-    } - u8::from(term.cursor_style().blinking);
+    let style = term.cursor_style();
+    // The style itself, not the rendered cursor, which reads Hidden while ?25 is off.
+    let shape = match style.shape {
+        // Never set by the app: hand the cursor back to the outer terminal's own default.
+        super::UNSET_CURSOR => 0,
+        CursorShape::Beam => 6 - u8::from(style.blinking),
+        CursorShape::Underline => 4 - u8::from(style.blinking),
+        _ => 2 - u8::from(style.blinking),
+    };
     let _ = write!(
         out,
         "\x1b[{shape} q\x1b[{};{}H",
@@ -253,6 +257,27 @@ mod tests {
                 .mode()
                 .intersects(TermMode::SGR_MOUSE | TermMode::SHOW_CURSOR)
         );
+    }
+
+    #[test]
+    fn cursor_style_replays_only_what_the_app_set() {
+        for (input, expected) in [
+            ("", "\x1b[0 q"),
+            ("\x1b[5 q", "\x1b[5 q"),
+            ("\x1b[2 q", "\x1b[2 q"),
+            ("\x1b[?25l\x1b[6 q", "\x1b[6 q"),
+            ("\x1b[6 q\x1b[0 q", "\x1b[0 q"),
+            ("\x1b[4 q\x1bc", "\x1b[0 q"),
+        ] {
+            let mut inner = Terminal::new(Size::new(3, 10).unwrap());
+            inner.feed(input.as_bytes());
+            let screen = inner.snapshot();
+            let segment = format!("\x1b[=0u{expected}\x1b[1;1H");
+            assert!(
+                screen.contains(&segment),
+                "input {input:?}: want {segment:?} in {screen:?}"
+            );
+        }
     }
 
     #[test]

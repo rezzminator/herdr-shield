@@ -193,7 +193,12 @@ fn actual_reconnect_roundtrips_mouse_focus_paste_unicode_modes_theme_and_reset()
     let meta = terminal(&jail, "input");
     let id = meta["id"].as_str().unwrap();
     let mut first = Attachment::new(&jail, id);
-    let rendered = first.output_until(|bytes| bytes.windows(6).any(|value| value == b"?1006h"));
+    // Up to the end of the frame that set the modes, so its cursor style is in.
+    let rendered = first.output_until(|bytes| {
+        let text = String::from_utf8_lossy(bytes);
+        text.rfind("?1006h")
+            .is_some_and(|at| text[at..].contains("?2026l"))
+    });
     assert!(String::from_utf8_lossy(&rendered).contains("界e\u{301}"));
     for mode in ["?1049h", "?2004h", "?1002h", "?1004h", "?1h", "\x1b="] {
         assert!(
@@ -202,6 +207,10 @@ fn actual_reconnect_roundtrips_mouse_focus_paste_unicode_modes_theme_and_reset()
         );
     }
     assert!(String::from_utf8_lossy(&rendered).contains("https://example.invalid/"));
+    // The app never styled its cursor: the outer terminal keeps its own default.
+    assert!(String::from_utf8_lossy(&rendered).contains("\x1b[0 q"));
+    assert!(!String::from_utf8_lossy(&rendered).contains("\x1b[2 q"));
+    assert!(!String::from_utf8_lossy(&rendered).contains("REVUQUNIRUQ="));
     first.master.write_all(b"before|").unwrap();
     wait(|| fs::read(jail.root.join("input-transcript")).is_ok_and(|value| value == b"before|"));
     drop(first);
@@ -229,15 +238,18 @@ fn actual_reconnect_roundtrips_mouse_focus_paste_unicode_modes_theme_and_reset()
     reattached.master.write_all(corpus).unwrap();
     let expected = [b"before|".as_slice(), corpus].concat();
     wait(|| fs::read(jail.root.join("input-transcript")).is_ok_and(|value| value == expected));
-    let reset =
-        reattached.output_until(|bytes| String::from_utf8_lossy(bytes).contains("RESET_OK"));
+    let reset = reattached.output_until(|bytes| {
+        let text = String::from_utf8_lossy(bytes);
+        text.contains("RESET_OK") && text.contains("\x1b]52;c;TElWRQ==\x1b\\")
+    });
     let reset = String::from_utf8_lossy(&reset);
+    assert!(!reset.contains("REVUQUNIRUQ="));
     for mode in ["?2004l", "?1006l", "?1002l", "?1004l", "?1l"] {
         assert!(reset.contains(mode), "reset mode {mode}");
     }
     assert_eq!(jail.metadata()["child"], meta["child"]);
     println!(
-        "PASS actual reconnect: exact input bytes for paste/Unicode/SGR+legacy mouse/focus/application keys; theme, links, modes, reset; same child"
+        "PASS actual reconnect: exact input bytes for paste/Unicode/SGR+legacy mouse/focus/application keys; theme, links, modes, default cursor, live-only clipboard write, reset; same child"
     );
 }
 
