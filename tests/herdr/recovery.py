@@ -90,7 +90,7 @@ def resume_test(jail):
     config.chmod(0o600)
     def choose(key, allowed):
         master,slave=pty.openpty()
-        process=subprocess.Popen([jail.keeper,'attach',meta['id']],env=jail.env,cwd=jail.root,stdin=slave,stdout=slave,stderr=slave,start_new_session=True)
+        process=subprocess.Popen([jail.shield,'attach',meta['id']],env=jail.env,cwd=jail.root,stdin=slave,stdout=slave,stderr=slave,start_new_session=True)
         os.close(slave)
         jail.processes.append((process,identity(process.pid),'recovery'))
         output=bytearray()
@@ -164,10 +164,10 @@ def resume_test(jail):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--herdr', required=True)
-    parser.add_argument('--keeper', required=True)
+    parser.add_argument('--shield', required=True)
     parser.add_argument('--root', type=pathlib.Path, required=True)
     args = parser.parse_args()
-    jail = Jail(args.root, str(pathlib.Path(args.herdr).resolve()), str(pathlib.Path(args.keeper).resolve()))
+    jail = Jail(args.root, str(pathlib.Path(args.herdr).resolve()), str(pathlib.Path(args.shield).resolve()))
     try:
         resume_test(jail)
     finally:

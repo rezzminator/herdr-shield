@@ -27,7 +27,7 @@ pub fn endpoint() -> Result<PathBuf> {
         return fail("Herdr endpoint must be absolute");
     }
     if std::env::var_os("HERDR_SHIELD_INNER").is_some() {
-        return fail("recursive keeper invocation refused");
+        return fail("recursive shield invocation refused");
     }
     Ok(path)
 }
@@ -63,11 +63,11 @@ pub fn rpc(socket: &Path, method: &str, params: Value) -> Result<Value> {
     let mut stream = connect(socket)?;
     serde_json::to_writer(
         &mut stream,
-        &json!({"id":"keeper-local","method":method,"params":params}),
+        &json!({"id":"shield-local","method":method,"params":params}),
     )?;
     stream.write_all(b"\n")?;
     let value: Value = crate::config::decode_json(&line(&mut BufReader::new(stream))?)?;
-    if value["id"] != "keeper-local" {
+    if value["id"] != "shield-local" {
         return fail("upstream correlation mismatch");
     }
     if !value["error"].is_null() {

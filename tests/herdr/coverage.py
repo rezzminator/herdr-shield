@@ -49,7 +49,7 @@ def census(jail):
     config = jail.root / 'c/herdr/config.toml'
     original = config.read_text()
     # A pane created before configuration cannot be adopted retroactively.
-    config.write_text(original.replace(jail.keeper, str(jail.root / 'dummy-shell')))
+    config.write_text(original.replace(jail.shield, str(jail.root / 'dummy-shell')))
     server = jail.server()
     jail.client()
     preexisting = wait(lambda: jail.api('pane.list')['panes'])[0]['pane_id']
@@ -291,10 +291,10 @@ def recreated_session_does_not_close_retained_holder(jail, server, retained):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--herdr', required=True)
-    parser.add_argument('--keeper', required=True)
+    parser.add_argument('--shield', required=True)
     parser.add_argument('--root', type=pathlib.Path, required=True)
     args = parser.parse_args()
-    jail = Jail(args.root, str(pathlib.Path(args.herdr).resolve()), str(pathlib.Path(args.keeper).resolve()))
+    jail = Jail(args.root, str(pathlib.Path(args.herdr).resolve()), str(pathlib.Path(args.shield).resolve()))
     try:
         server, protected = census(jail)
         pane, meta = protected[0]

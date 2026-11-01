@@ -65,7 +65,7 @@ fn failed_manager_cgroup_native_resume_and_recursive_launch_open_plain_shell() {
             "manager" => "service creation failed",
             "cgroup" => "cgroup verification failed",
             "native" => "resume_agents_on_restore",
-            "recursive" => "recursive keeper refused",
+            "recursive" => "recursive shield refused",
             "config" => {
                 "UNPROTECTED: configuration unusable: EOF while parsing an object at line 1 column 1; opening configured plain shell"
             }

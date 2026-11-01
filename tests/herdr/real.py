@@ -62,18 +62,18 @@ class ProcessRecords(list):
 
 
 class Jail:
-    def __init__(self, root, herdr, keeper):
+    def __init__(self, root, herdr, shield):
         assert root.is_absolute() and root.is_dir() and not root.is_symlink()
         assert hashlib.sha256(pathlib.Path(herdr).read_bytes()).hexdigest() == PINS['HERDR_SHA256'], 'pinned Herdr artifact required'
         self.root = root / f'h{os.getpid()}'
         assert not self.root.exists(), 'fresh jail required'
         self.root.mkdir(mode=0o700)
-        self.herdr, self.keeper = herdr, keeper
+        self.herdr, self.shield = herdr, shield
         self.processes, self.units, self.clients, self.logs = ProcessRecords(self.root), set(), [], []
         self.client_output = []
         self.handoff_pending = False
         self.env = {'HOME': str(self.root), 'PATH': '/usr/bin:/bin', 'TERM': 'xterm-256color',
-                    'LANG': 'C.UTF-8', 'SHELL': '/bin/sh', 'HERDR_SHIELD_TEST_PREFIX': 'herdr-shield-test-', 'HERDR_SHIELD_TEST_BIN':keeper}
+                    'LANG': 'C.UTF-8', 'SHELL': '/bin/sh', 'HERDR_SHIELD_TEST_PREFIX': 'herdr-shield-test-', 'HERDR_SHIELD_TEST_BIN':shield}
         for key, value in [('XDG_CONFIG_HOME', 'c'), ('XDG_STATE_HOME', 's'),
                            ('XDG_DATA_HOME', 'd'), ('XDG_CACHE_HOME', 'k'), ('XDG_RUNTIME_DIR', 'r')]:
             path = self.root / value
@@ -82,7 +82,7 @@ class Jail:
         config = self.root / 'c/herdr'
         config.mkdir(mode=0o700)
         (config / 'config.toml').write_text(
-            'onboarding = false\n[terminal]\ndefault_shell = ' + json.dumps(keeper) +
+            'onboarding = false\n[terminal]\ndefault_shell = ' + json.dumps(shield) +
             '\nshell_mode = "non_login"\n[session]\nresume_agents_on_restore = false\n')
         self.socket = config / 'herdr.sock'
         self.env['HERDR_SOCKET_PATH'] = str(self.socket)
@@ -98,7 +98,7 @@ class Jail:
         (plugin/'bin').mkdir(parents=True,mode=0o700)
         source_root=pathlib.Path(__file__).resolve().parents[2]
         (plugin/'herdr-plugin.toml').write_bytes((source_root/'herdr-plugin.toml').read_bytes())
-        (plugin/'bin/herdr-shield').write_bytes(pathlib.Path(keeper).read_bytes())
+        (plugin/'bin/herdr-shield').write_bytes(pathlib.Path(shield).read_bytes())
         (plugin/'bin/herdr-shield').chmod(0o700)
         self.plugin=plugin
 
@@ -196,7 +196,7 @@ class Jail:
 
     def keep(self, *args):
         self.guard()
-        return subprocess.run([self.keeper, *args], env=self.env, cwd=self.root,
+        return subprocess.run([self.shield, *args], env=self.env, cwd=self.root,
                               stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=15)
 
     def terminate(self, process, sig=signal.SIGTERM):
@@ -312,7 +312,7 @@ def exercise(jail):
     version = jail.command('--version')
     assert version.returncode == 0 and PINS['HERDR_VERSION'] in version.stdout, version.stdout
     print('ARTIFACT herdr sha256', hashlib.sha256(pathlib.Path(jail.herdr).read_bytes()).hexdigest(), flush=True)
-    print('ARTIFACT keeper sha256', hashlib.sha256(pathlib.Path(jail.keeper).read_bytes()).hexdigest(), flush=True)
+    print('ARTIFACT shield sha256', hashlib.sha256(pathlib.Path(jail.shield).read_bytes()).hexdigest(), flush=True)
     server = jail.server()
     jail.api('plugin.link', {'path':str(jail.plugin)})
     plugins=jail.api('plugin.list')
@@ -432,7 +432,7 @@ def exercise(jail):
     wait(lambda: next(p for p in json.loads(jail.keep('list', '--json').stdout)['panes'] if p['pane_id'] == respawn_pane)['status'] == 'PROTECTED')
     config = jail.root / 'c/herdr/config.toml'
     saved_config = config.read_text()
-    config.write_text(saved_config.replace(json.dumps(jail.keeper), json.dumps(str(jail.root / 'dummy-shell'))))
+    config.write_text(saved_config.replace(json.dumps(jail.shield), json.dumps(str(jail.root / 'dummy-shell'))))
     jail.api('server.reload_config')
     old_shell = jail.api('pane.process_info', {'pane_id': plain_respawn})['process_info']['shell_pid']
     try:
@@ -455,10 +455,10 @@ def exercise(jail):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--herdr', required=True)
-    parser.add_argument('--keeper', required=True)
+    parser.add_argument('--shield', required=True)
     parser.add_argument('--root', type=pathlib.Path, required=True)
     args = parser.parse_args()
-    jail = Jail(args.root, str(pathlib.Path(args.herdr).resolve()), str(pathlib.Path(args.keeper).resolve()))
+    jail = Jail(args.root, str(pathlib.Path(args.herdr).resolve()), str(pathlib.Path(args.shield).resolve()))
     try:
         exercise(jail)
     finally:

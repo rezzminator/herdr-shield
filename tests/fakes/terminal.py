@@ -1,5 +1,5 @@
 #!/usr/bin/python3
-"""Owned raw PTY oracle; results are bytes read by the child, never keeper status."""
+"""Owned raw PTY oracle; results are bytes read by the child, never shield status."""
 import json
 import os
 import pathlib

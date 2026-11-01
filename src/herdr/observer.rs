@@ -85,7 +85,7 @@ fn observe(shared: Shared) -> Result<()> {
         state.bind(binding)?;
         return Ok(());
     }
-    let request = json!({"id":"keeper-observer","method":"events.subscribe","params":{"subscriptions":[{"type":"pane.closed"},{"type":"pane.moved"}]}});
+    let request = json!({"id":"shield-observer","method":"events.subscribe","params":{"subscriptions":[{"type":"pane.closed"},{"type":"pane.moved"}]}});
     serde_json::to_writer(&mut socket, &request)?;
     socket.write_all(b"\n")?;
     socket.set_read_timeout(None)?;

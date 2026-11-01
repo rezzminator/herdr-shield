@@ -7,7 +7,7 @@ if [[ $# != 2 || $1 != --herdr || ! -x $2 ]]; then
 fi
 : "${HERDR_SHIELD_BUILD_ROOT:?set an absolute private throwaway build root}"
 : "${HERDR_SHIELD_BIN:?set the built herdr-shield binary path}"
-/usr/bin/python3 -I -B tests/herdr/real.py --herdr "$2" --keeper "$HERDR_SHIELD_BIN" --root "$HERDR_SHIELD_BUILD_ROOT"
-/usr/bin/python3 -I -B tests/herdr/coverage.py --herdr "$2" --keeper "$HERDR_SHIELD_BIN" --root "$HERDR_SHIELD_BUILD_ROOT"
-/usr/bin/python3 -I -B tests/herdr/jail.py --herdr "$2" --keeper "$HERDR_SHIELD_BIN" --root "$HERDR_SHIELD_BUILD_ROOT"
-exec /usr/bin/python3 -I -B tests/herdr/recovery.py --herdr "$2" --keeper "$HERDR_SHIELD_BIN" --root "$HERDR_SHIELD_BUILD_ROOT"
+/usr/bin/python3 -I -B tests/herdr/real.py --herdr "$2" --shield "$HERDR_SHIELD_BIN" --root "$HERDR_SHIELD_BUILD_ROOT"
+/usr/bin/python3 -I -B tests/herdr/coverage.py --herdr "$2" --shield "$HERDR_SHIELD_BIN" --root "$HERDR_SHIELD_BUILD_ROOT"
+/usr/bin/python3 -I -B tests/herdr/jail.py --herdr "$2" --shield "$HERDR_SHIELD_BIN" --root "$HERDR_SHIELD_BUILD_ROOT"
+exec /usr/bin/python3 -I -B tests/herdr/recovery.py --herdr "$2" --shield "$HERDR_SHIELD_BIN" --root "$HERDR_SHIELD_BUILD_ROOT"

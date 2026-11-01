@@ -18,10 +18,10 @@ from real import PINS, Jail, identity, live, wait
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--herdr', required=True)
-    parser.add_argument('--keeper', required=True)
+    parser.add_argument('--shield', required=True)
     parser.add_argument('--root', type=pathlib.Path, required=True)
     args = parser.parse_args()
-    jail = Jail(args.root, str(pathlib.Path(args.herdr).resolve()), str(pathlib.Path(args.keeper).resolve()))
+    jail = Jail(args.root, str(pathlib.Path(args.herdr).resolve()), str(pathlib.Path(args.shield).resolve()))
     outside_env = dict(jail.env, HOME=str(args.root))
     outside = subprocess.Popen(['/bin/sleep', '60'], env=outside_env)
     owned = None

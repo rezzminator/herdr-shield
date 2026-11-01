@@ -96,7 +96,7 @@ pub fn default_shell(paths: &Paths) -> Result<()> {
 /// This pane's verified holder, found or created; any failure leaves no new holder serving.
 fn bootstrap(paths: &Paths) -> Result<(Metadata, registry::Binding)> {
     if std::env::var_os("HERDR_SHIELD_INNER").is_some() {
-        return fail("recursive keeper refused");
+        return fail("recursive shield refused");
     }
     let binding = crate::herdr::binding()?;
     crate::herdr::prerequisites(paths)?;
