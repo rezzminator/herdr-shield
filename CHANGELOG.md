@@ -2,7 +2,11 @@
 
 Every release of herdr-shield. Versions follow [semantic versioning](https://semver.org); each release is the `main` commit tagged `v<version>`, with a GitHub release carrying its note from [`releases/`](./releases/). Releases are source only: build the binary as the [README](./README.md#install) shows.
 
-## [Unreleased]
+## [0.2.0] — 2026-11-01
+
+### Changed
+
+- **Breaking: holders speak a new wire magic.** Every frame between a holder and its clients now starts with `HDRSHLD1`, where 0.1.0 wrote `HDRKEEP1`. A 0.2.0 binary and a holder started by 0.1.0 refuse each other's frames before the version handshake, so a 0.2.0 `attach`, `list`, `reconcile` or live-handoff rebind cannot reach a 0.1.0 holder, and the connection ends without naming the compatible client. To migrate: keep the 0.1.0 executable while its holders live, as the README's upgrade section says, and use it to `herdr-shield attach` or `herdr-shield kill` each of them; panes opened after the upgrade get 0.2.0 holders.
 
 ## [0.1.0] — 2026-11-01
 

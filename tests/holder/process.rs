@@ -19,7 +19,7 @@ fn frame(meta: &Value, kind: &str, generation: u64, payload: Value) -> Value {
 }
 fn send(stream: &mut UnixStream, value: Value) {
     let bytes = serde_json::to_vec(&value).unwrap();
-    stream.write_all(b"HDRKEEP1").unwrap();
+    stream.write_all(b"HDRSHLD1").unwrap();
     stream
         .write_all(&(bytes.len() as u32).to_be_bytes())
         .unwrap();
@@ -28,7 +28,7 @@ fn send(stream: &mut UnixStream, value: Value) {
 fn read(stream: &mut UnixStream) -> Value {
     let mut header = [0u8; 12];
     stream.read_exact(&mut header).unwrap();
-    assert_eq!(&header[..8], b"HDRKEEP1");
+    assert_eq!(&header[..8], b"HDRSHLD1");
     let length = u32::from_be_bytes(header[8..].try_into().unwrap()) as usize;
     assert!(length <= 1024 * 1024);
     let mut bytes = vec![0; length];

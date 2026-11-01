@@ -175,7 +175,7 @@ Native agent discovery in Herdr sees the attach client, not the process inside t
 
 ## Upgrade and uninstall
 
-Each holder keeps running the executable it started from, so install each version in its own directory and keep an old one while its holders live; never kill holders just to upgrade. A newer client attaches to an older compatible holder; an incompatible major version prints the path of the compatible client.
+Each holder keeps running the executable it started from, so install each version in its own directory and keep an old one while its holders live; never kill holders just to upgrade. A newer client attaches to an older compatible holder; an incompatible major version prints the path of the compatible client. Holders started by 0.1.0 speak an older wire format that 0.2.0 and later refuse before that check: keep the 0.1.0 executable to attach to or `kill` them.
 
 To uninstall, restore your previous `terminal.default_shell`, run `herdr plugin unlink herdr-shield`, and leave running holders alone: attach to each with its old executable, or end it with `herdr-shield kill <holder-id>`. Unlinking does not adopt, resume or end any workload.
 

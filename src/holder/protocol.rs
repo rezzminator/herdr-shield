@@ -8,7 +8,7 @@ use serde_json::{Value, json};
 
 use crate::{Result, config::MAX_JSON, fail};
 
-pub const MAGIC: &[u8; 8] = b"HDRKEEP1";
+pub const MAGIC: &[u8; 8] = b"HDRSHLD1";
 pub const MAJOR: u16 = 1;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
