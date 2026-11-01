@@ -1,0 +1,18 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="640" viewBox="0 0 1280 640">
+  <rect width="1280" height="640" fill="#0f1419"/>
+  <g font-family="DejaVu Sans, Helvetica, Arial, sans-serif">
+    <g transform="translate(120 150)">
+      <path d="M48 0 L96 18 V60 C96 96 74 118 48 130 C22 118 0 96 0 60 V18 Z" fill="none" stroke="#5ccfe6" stroke-width="8" stroke-linejoin="round"/>
+      <text x="48" y="80" text-anchor="middle" font-family="DejaVu Sans Mono, monospace" font-size="40" font-weight="bold" fill="#5ccfe6">$_</text>
+    </g>
+    <text x="250" y="232" font-size="96" font-weight="bold" fill="#e6e1cf">herdr-shield</text>
+    <text x="120" y="360" font-size="35" fill="#e6e1cf">Herdr plugin that keeps pane shells and coding agents</text>
+    <text x="120" y="412" font-size="35" fill="#e6e1cf">alive across Herdr server crashes, in systemd user services</text>
+    <g font-family="DejaVu Sans Mono, monospace" font-size="30">
+      <text x="120" y="520" fill="#f07178">herdr server: killed</text>
+      <text x="510" y="520" fill="#5c6773">→</text>
+      <text x="560" y="520" fill="#bae67e">your shell: same PID, same screen</text>
+    </g>
+    <text x="120" y="585" font-size="26" fill="#5c6773">Linux · systemd user manager · Rust · MIT</text>
+  </g>
+</svg>
