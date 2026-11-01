@@ -14,6 +14,7 @@ use crate::{Result, fail};
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 struct Accepted {
     source: String,
+    #[serde(default)]
     agent: String,
     argv: Vec<String>,
 }
@@ -190,7 +191,24 @@ pub fn provenance(
     (Identity::read(foreground).ok()? == identity).then_some(identity)
 }
 
-pub fn track(shared: &Shared, request: &Value, peer: u32) -> Result<Value> {
+/// The request to forward, tracked for resume capture. A tracking failure is recorded in
+/// resume_status and the request is still forwarded, uncaptured.
+pub fn track(shared: &Shared, request: &Value, peer: u32) -> Value {
+    track_capture(shared, request, peer).unwrap_or_else(|error| {
+        let status = format!(
+            "resume capture tracking failed: {error}; request forwarded, no fallback captured"
+        );
+        match shared.lock() {
+            Ok(mut state) => state.meta.resume_status = status,
+            Err(_) => eprintln!("herdr-shield: {status}"),
+        }
+        let mut untracked = request.clone();
+        untracked["_capture"] = json!({"before":null});
+        untracked
+    })
+}
+
+fn track_capture(shared: &Shared, request: &Value, peer: u32) -> Result<Value> {
     let mut tracked = request.clone();
     if !matches!(
         request["method"].as_str(),
@@ -219,7 +237,7 @@ pub fn track(shared: &Shared, request: &Value, peer: u32) -> Result<Value> {
             });
     if fresh {
         state.meta.report_sequences.insert(source.into(), seq);
-        state.meta.save(&state.paths)?;
+        state.persist();
     }
     let argv = serde_json::from_value::<Vec<String>>(request["params"]["resume_argv"].clone()).ok();
     let process = argv
@@ -229,7 +247,7 @@ pub fn track(shared: &Shared, request: &Value, peer: u32) -> Result<Value> {
         Ok(saved) => Some(saved),
         Err(error) => {
             state.meta.resume_status = format!("accepted resume cannot be verified: {error}");
-            state.meta.save(&state.paths)?;
+            state.persist();
             None
         }
     };
@@ -248,7 +266,7 @@ pub fn track(shared: &Shared, request: &Value, peer: u32) -> Result<Value> {
         state.meta.resume_status =
             "report arbitration pending; no confirmed fallback offered".into();
     }
-    state.meta.save(&state.paths)?;
+    state.persist();
     tracked["_capture"] = json!({"fresh":fresh,"process":process,"before":before,"previous":previous,"epoch":state.meta.report_epoch});
     Ok(tracked)
 }
@@ -262,7 +280,7 @@ pub fn observe(shared: &Shared, request: &Value, response: &Value, generation: u
     }
     // Unit callers use this same seam; live requests are tracked before forwarding.
     let tracked = if request["_capture"].is_null() {
-        track(shared, request, 0)?
+        track(shared, request, 0)
     } else {
         request.clone()
     };
@@ -271,33 +289,54 @@ pub fn observe(shared: &Shared, request: &Value, response: &Value, generation: u
     }
     // Snapshot persistence is debounced upstream. Never hold up its response,
     // and never accumulate an unbounded worker per API report.
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    static WORKERS: AtomicUsize = AtomicUsize::new(0);
-    let mut active = WORKERS.load(Ordering::Acquire);
-    loop {
+    let job = (
+        std::sync::Arc::clone(shared),
+        tracked,
+        response.clone(),
+        generation,
+    );
+    {
+        let mut workers = WORKERS
+            .lock()
+            .map_err(|_| "capture worker mutex poisoned")?;
+        let active = workers.0;
         if active >= 4 {
+            // The newest report waits for the first free worker; the busy ones serve
+            // superseded epochs and end at their next check.
+            workers.1 = Some(job);
             return Ok(());
         }
-        match WORKERS.compare_exchange_weak(active, active + 1, Ordering::AcqRel, Ordering::Acquire)
-        {
-            Ok(_) => break,
-            Err(current) => active = current,
-        }
+        workers.0 += 1;
     }
-    let shared = std::sync::Arc::clone(shared);
-    let response = response.clone();
     let worker = std::thread::Builder::new()
         .name("herdr-capture".into())
         .spawn(move || {
-            let _ = observe_saved(&shared, &tracked, &response, generation);
-            WORKERS.fetch_sub(1, Ordering::AcqRel);
+            let mut job = Some(job);
+            while let Some((shared, tracked, response, generation)) = job.take() {
+                let _ = observe_saved(&shared, &tracked, &response, generation);
+                let Ok(mut workers) = WORKERS.lock() else {
+                    return;
+                };
+                job = workers.1.take();
+                if job.is_none() {
+                    workers.0 -= 1;
+                }
+            }
         });
     if let Err(error) = worker {
-        WORKERS.fetch_sub(1, Ordering::AcqRel);
+        if let Ok(mut workers) = WORKERS.lock() {
+            workers.0 -= 1;
+        }
         return Err(format!("accepted-state verification worker could not start: {error}").into());
     }
     Ok(())
 }
+
+/// One capture job: the holder, its tracked request, the upstream response and generation.
+type Capture = (Shared, Value, Value, u64);
+
+/// Running capture workers, and the newest report waiting for one.
+static WORKERS: std::sync::Mutex<(usize, Option<Capture>)> = std::sync::Mutex::new((0, None));
 
 fn observe_saved(
     shared: &Shared,
@@ -434,9 +473,70 @@ mod tests {
             atomic_json(&root.join("session.json"),&json!({"version":3,"workspaces":[{"id":"w1","public_pane_numbers":{"9":1},"tabs":[{"panes":{"9":{"agent_resume":slot,"agent_session":extra}}}]}]})).unwrap()
         };
         let request = |seq, argv| json!({"method":"pane.report_agent","params":{"pane_id":"w1:p1","source":"custom:dummy","agent":"dummy","seq":seq,"resume_argv":["dummy",argv]}});
+        assert_eq!(
+            serde_json::from_value::<Accepted>(
+                json!({"source":"custom:dummy","argv":["dummy","no-agent"]})
+            )
+            .unwrap(),
+            Accepted {
+                source: "custom:dummy".into(),
+                agent: String::new(),
+                argv: vec!["dummy".into(), "no-agent".into()],
+            },
+            "a slot without agent is still an accepted slot"
+        );
+        let untracked = track(
+            &shared,
+            &json!({"method":"pane.report_agent","params":{"pane_id":"w1:p1","seq":1}}),
+            0,
+        );
+        assert_eq!(untracked["_capture"], json!({"before":null}));
+        assert_eq!(
+            shared.lock().unwrap().meta.resume_status,
+            "resume capture tracking failed: missing report source; request forwarded, no fallback captured"
+        );
+        std::fs::write(root.join("not-a-directory"), b"").unwrap();
+        shared.lock().unwrap().paths.state = root.join("not-a-directory");
+        // A registry save that fails costs the record, never the capture: the confirmed
+        // fallback is demoted to pending before the report reaches Herdr.
         save(Value::Null, "initial");
-        let first = track(&shared, &request(1, "first"), 0).unwrap();
-        let newer = track(&shared, &request(2, "second"), 0).unwrap();
+        shared.lock().unwrap().meta.resume = Some(Resume {
+            argv: vec!["dummy".into(), "confirmed".into()],
+            process: None,
+            source: "custom:unsaved".into(),
+            agent: "dummy".into(),
+            seq: Some(0),
+        });
+        let unsaved = track(
+            &shared,
+            &json!({"method":"pane.report_agent","params":{"pane_id":"w1:p1","source":"custom:unsaved","seq":1}}),
+            0,
+        );
+        {
+            let mut state = shared.lock().unwrap();
+            assert_eq!(
+                (
+                    unsaved["_capture"]["previous"]["argv"].clone(),
+                    state.meta.resume.is_none(),
+                    state
+                        .meta
+                        .pending_resume
+                        .as_ref()
+                        .map(|resume| resume.argv.clone()),
+                    state.meta.resume_status.as_str()
+                ),
+                (
+                    json!(["dummy", "confirmed"]),
+                    true,
+                    Some(vec!["dummy".into(), "confirmed".into()]),
+                    "report arbitration pending; no confirmed fallback offered"
+                )
+            );
+            state.meta.pending_resume = None;
+            state.paths.state = root.clone();
+        }
+        let first = track(&shared, &request(1, "first"), 0);
+        let newer = track(&shared, &request(2, "second"), 0);
         save(
             json!({"source":"custom:dummy","agent":"dummy","argv":["dummy","first"]}),
             "old-epoch",
@@ -455,8 +555,8 @@ mod tests {
             shared.lock().unwrap().meta.resume.as_ref().unwrap().argv,
             ["dummy", "second"]
         );
-        let overlapping = track(&shared, &request(3, "refused"), 0).unwrap();
-        let last = track(&shared, &request(4, "also-refused"), 0).unwrap();
+        let overlapping = track(&shared, &request(3, "refused"), 0);
+        let last = track(&shared, &request(4, "also-refused"), 0);
         save(
             json!({"source":"custom:dummy","agent":"dummy","argv":["dummy","second"]}),
             "unchanged slot after overlapping rejected reports",
@@ -486,7 +586,7 @@ mod tests {
             Some(vec!["dummy".into(), "second".into()]),
             "overlapping reports must retain the independently confirmed unchanged fallback"
         );
-        let partial = track(&shared, &request(5, "refused"), 0).unwrap();
+        let partial = track(&shared, &request(5, "refused"), 0);
         assert!(
             shared.lock().unwrap().meta.resume.is_none(),
             "pending arbitration must suppress stale fallback immediately"
@@ -500,14 +600,14 @@ mod tests {
         )
         .unwrap();
         assert!(shared.lock().unwrap().meta.resume.is_none());
-        let stale = track(&shared, &request(2, "stale"), 0).unwrap();
+        let stale = track(&shared, &request(2, "stale"), 0);
         save(
             json!({"source":"custom:dummy","agent":"dummy","argv":["dummy","stale"]}),
             "unrelated mutation",
         );
         observe_saved(&shared, &stale, &json!({"result":{"type":"ok"}}), 1).unwrap();
         assert!(shared.lock().unwrap().meta.resume.is_none());
-        let pending = track(&shared, &request(6, "pending"), 0).unwrap();
+        let pending = track(&shared, &request(6, "pending"), 0);
         for _ in 0..128 {
             observe(&shared, &pending, &json!({"result":{"type":"ok"}}), 1).unwrap();
         }
@@ -519,7 +619,8 @@ mod tests {
                 .count()
         };
         let started = Instant::now() + Duration::from_secs(2);
-        while active() < 4 {
+        // Settled once every started worker has named its thread.
+        while active() < 4 || active() != WORKERS.lock().unwrap().0 {
             assert!(
                 Instant::now() < started,
                 "capture workers were not independently enumerated"
@@ -531,7 +632,30 @@ mod tests {
             4,
             "capture report flood exceeded four independently observed worker threads"
         );
-        shared.lock().unwrap().meta.report_epoch += 1;
+        // The newest report, arriving while four workers serve a superseded epoch, is still captured.
+        let newest = track(&shared, &request(7, "newest"), 0);
+        observe(&shared, &newest, &json!({"result":{"type":"ok"}}), 1).unwrap();
+        save(
+            json!({"source":"custom:dummy","agent":"dummy","argv":["dummy","newest"]}),
+            "newest report",
+        );
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while shared
+            .lock()
+            .unwrap()
+            .meta
+            .resume
+            .as_ref()
+            .map(|resume| resume.argv.clone())
+            != Some(vec!["dummy".into(), "newest".into()])
+        {
+            assert!(
+                Instant::now() < deadline,
+                "newest report never captured: {}",
+                shared.lock().unwrap().meta.resume_status
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
         let deadline = Instant::now() + Duration::from_secs(2);
         while active() != 0 {
             assert!(

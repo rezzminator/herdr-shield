@@ -68,16 +68,27 @@ pub const DOORS: &[(&str, &str)] = &[
     ),
 ];
 
-pub fn enumerate(result: Value) -> Result<Vec<super::schema::PaneInfo>> {
-    let typed: super::schema::ResponseResult = serde_json::from_value(result)?;
-    match typed {
-        super::schema::ResponseResult::PaneList { panes } => Ok(panes),
-        _ => fail("ERROR: enumeration response is not pane_list"),
+/// One enumerated pane: its public and terminal IDs, the only fields coverage reads.
+#[derive(serde::Deserialize)]
+pub struct Pane {
+    pub pane_id: String,
+    pub terminal_id: String,
+}
+
+/// The panes of a pane.list result. A field or status the pinned schema lacks costs nothing;
+/// a pane without its IDs is an enumeration ERROR.
+pub fn enumerate(result: Value) -> Result<Vec<Pane>> {
+    if result["type"] != "pane_list" {
+        return fail("ERROR: enumeration response is not pane_list");
     }
+    if serde_json::from_value::<super::schema::ResponseResult>(result.clone()).is_err() {
+        eprintln!("herdr-shield: pane.list differs from the pinned v22 schema; reading pane IDs");
+    }
+    Ok(serde_json::from_value(result["panes"].clone())?)
 }
 
 pub fn report(paths: &Paths) -> Result<Value> {
-    let metas = Metadata::all(paths)?;
+    let (metas, unreadable) = Metadata::all(paths)?;
     let endpoint = super::endpoint();
     let enumeration = match &endpoint {
         Ok(socket) => super::rpc(socket, "pane.list", json!({})).and_then(enumerate),
@@ -210,14 +221,31 @@ pub fn report(paths: &Paths) -> Result<Value> {
                 .map(|error| format!("PTY census ERROR: {error}"))
         });
     let persisted = paths.state.join("last-error.json");
-    let previous = if persisted.exists() {
-        Some(crate::config::read_json::<Value>(&persisted)?)
-    } else {
-        None
-    };
+    // A display field only: an unreadable record says so and never aborts the report.
+    let previous = persisted.exists().then(|| {
+        crate::config::read_json::<Value>(&persisted)
+            .unwrap_or_else(|error| json!({"unreadable":error.to_string()}))
+    });
     Ok(
-        json!({"enumeration":if error.is_some(){"ERROR"}else if panes.is_empty(){"EMPTY"}else{"OK"},"error":error,"pty_enumeration":{"status":if process_census.is_ok(){"OK"}else{"ERROR"},"observed":process_census.as_ref().ok().map(Vec::len)},"previous_reconciliation_error":previous,"panes":panes,"holders":holders,"coverage":DOORS.iter().map(|(door,status)|json!({"door":door,"status":status})).collect::<Vec<_>>()}),
+        json!({"enumeration":if error.is_some(){"ERROR"}else if panes.is_empty(){"EMPTY"}else{"OK"},"error":error,"pty_enumeration":{"status":if process_census.is_ok(){"OK"}else{"ERROR"},"observed":process_census.as_ref().ok().map(Vec::len)},"previous_reconciliation_error":previous,"panes":panes,"holders":holders,"unreadable_holders":unreadable,"coverage":DOORS.iter().map(|(door,status)|json!({"door":door,"status":status})).collect::<Vec<_>>()}),
     )
+}
+
+/// The ERROR a report's unreadable holder records leave once the rest is printed.
+fn unreadable(report: &Value) -> Result<()> {
+    let ids: Vec<_> = report["unreadable_holders"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|record| record["id"].as_str())
+        .collect();
+    if !ids.is_empty() {
+        return fail(&format!(
+            "ERROR: unreadable holder records retained: {}",
+            ids.join(", ")
+        ));
+    }
+    Ok(())
 }
 
 pub fn run(paths: &Paths) -> Result<()> {
@@ -230,14 +258,16 @@ pub fn run(paths: &Paths) -> Result<()> {
         println!("{}", serde_json::to_string_pretty(&report)?);
         return fail("ERROR: pane enumeration failed; all holders retained");
     }
-    if paths.state.join("last-error.json").exists() {
+    // A run that ends in the unreadable-records ERROR is no success to record.
+    let retained = unreadable(&report);
+    if retained.is_ok() && paths.state.join("last-error.json").exists() {
         atomic_json(
             &paths.state.join("last-error.json"),
             &json!({"error":null,"action":"last reconciliation succeeded"}),
         )?;
     }
     println!("{}", serde_json::to_string_pretty(&report)?);
-    Ok(())
+    retained
 }
 
 pub fn event(paths: &Paths) -> Result<()> {
@@ -245,8 +275,13 @@ pub fn event(paths: &Paths) -> Result<()> {
     if bytes.len() > crate::config::MAX_JSON {
         return fail("event exceeds limit");
     }
-    let _: super::schema::EventEnvelope = serde_json::from_str(&bytes)?;
-    // Hook environment is an unauthenticated hint, never a termination capability.
+    // Hook environment is an unauthenticated hint, never a termination capability: an
+    // event the pinned schema lacks still asks for the reconcile it names.
+    if let Err(error) = serde_json::from_str::<super::schema::EventEnvelope>(&bytes) {
+        eprintln!(
+            "herdr-shield: event hint outside the pinned v22 schema ({error}); reconciling anyway"
+        );
+    }
     run(paths)
 }
 
@@ -269,7 +304,7 @@ pub fn list(paths: &Paths, action: bool) -> Result<()> {
     if report["enumeration"] == "ERROR" {
         return fail("ERROR: pane enumeration failed; holder list retained");
     }
-    Ok(())
+    unreadable(&report)
 }
 
 #[cfg(test)]
@@ -284,6 +319,19 @@ mod tests {
         );
         assert!(enumerate(json!({"type":"ok"})).is_err());
         assert!(enumerate(json!({"type":"pane_list","panes":null})).is_err());
+        let panes = enumerate(json!({"type":"pane_list","panes":[{"pane_id":"w1:p1","terminal_id":"t1","workspace_id":"w1","tab_id":"w1:t1","focused":true,"agent_status":"future_status","future_field":1}]})).unwrap();
+        assert_eq!(
+            panes
+                .iter()
+                .map(|pane| (pane.pane_id.as_str(), pane.terminal_id.as_str()))
+                .collect::<Vec<_>>(),
+            [("w1:p1", "t1")],
+            "an unpinned field or status costs nothing"
+        );
+        assert!(
+            enumerate(json!({"type":"pane_list","panes":[{"pane_id":"w1:p1"}]})).is_err(),
+            "a pane without its IDs is an enumeration ERROR"
+        );
     }
     #[test]
     fn closed_launch_census_visibly_names_every_unprotected_door() {

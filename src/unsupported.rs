@@ -41,6 +41,7 @@ pub fn run(path: &Path) -> Result<()> {
         return fail("plain-shell configuration exceeds limit");
     }
     let config: Config = serde_json::from_slice(&bytes)?;
+    config.warn_ignored();
     config.validate()?;
     let mut command = crate::shell::command(&config.shell);
     command.args(&config.args).env_remove("HERDR_SHIELD_INNER");
@@ -75,6 +76,7 @@ mod tests {
             &Config {
                 shell: "/bin/sh".into(),
                 args: vec!["-c".into(), "printf PLATFORM_PLAIN_SHELL".into()],
+                ..Config::default()
             },
         )
         .unwrap();

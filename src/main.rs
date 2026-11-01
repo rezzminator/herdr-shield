@@ -139,7 +139,17 @@ fn doctor(paths: &config::Paths) -> Result<()> {
     if pong["protocol"] != 22 {
         return fail("incompatible upstream; protocol 22 required");
     }
-    let holders = holder::registry::Metadata::all(paths)?;
+    let (holders, unreadable) = holder::registry::Metadata::all(paths)?;
+    if !unreadable.is_empty() {
+        let records: Vec<_> = unreadable
+            .iter()
+            .map(|record| format!("{} ({})", record.id, record.error))
+            .collect();
+        return fail(&format!(
+            "ERROR: unreadable holder records retained: {}",
+            records.join(", ")
+        ));
+    }
     let last_error = paths.state.join("last-error.json");
     if last_error.exists() {
         let previous: serde_json::Value = config::read_json(&last_error)?;

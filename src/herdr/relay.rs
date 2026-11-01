@@ -30,12 +30,25 @@ pub fn start(shared: Shared, path: PathBuf) -> Result<()> {
                 let listener = tokio::net::UnixListener::from_std(listener)?;
                 let permits = Arc::new(tokio::sync::Semaphore::new(32));
                 loop {
-                    let (stream, _) = listener.accept().await?;
+                    // A failed accept (EMFILE, ECONNABORTED) costs that connection, never the relay.
+                    let stream = match listener
+                        .accept()
+                        .await
+                        .and_then(|(stream, _)| stream.into_std())
+                    {
+                        Ok(stream) => stream,
+                        Err(error) => {
+                            eprintln!(
+                                "herdr-shield: API relay accept failed: {error}; still serving"
+                            );
+                            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                            continue;
+                        }
+                    };
                     let Ok(permit) = Arc::clone(&permits).try_acquire_owned() else {
                         continue;
                     };
                     let holder = Arc::clone(&shared);
-                    let stream = stream.into_std()?;
                     tokio::task::spawn_blocking(move || {
                         let _permit = permit;
                         if connection(stream, holder).is_err() {
@@ -87,10 +100,8 @@ fn connection(mut client: UnixStream, shared: Shared) -> Result<()> {
         .clone();
     let generation = meta.generation;
     let mut aliases = Aliases::for_holder(&meta);
-    let census = super::rpc(&meta.binding.socket, "session.snapshot", json!({}))
-        .ok()
-        .filter(|value| serde_json::from_value::<schema::ResponseResult>(value.clone()).is_ok());
-    aliases.verify_live(census.as_ref().and_then(|result| result.get("snapshot")));
+    let census = census(super::rpc(&meta.binding.socket, "session.snapshot", json!({})).ok());
+    aliases.verify_live(census.as_ref());
     let pong = super::rpc(&meta.binding.socket, "ping", json!({}))?;
     if pong["protocol"] != 22 {
         return error(
@@ -213,7 +224,7 @@ fn connection(mut client: UnixStream, shared: Shared) -> Result<()> {
                     if pending.len() >= 128 || pending.contains_key(&key) {
                         return fail("relay request bound or duplicate id");
                     }
-                    pending.insert(key, super::resume::track(&request_holder, &value, peer)?);
+                    pending.insert(key, super::resume::track(&request_holder, &value, peer));
                 }
                 serde_json::to_writer(&mut upstream, &value)?;
                 upstream.write_all(b"\n")?;
@@ -269,14 +280,7 @@ fn connection(mut client: UnixStream, shared: Shared) -> Result<()> {
             } else {
                 None
             };
-            if let Some(request) = request {
-                observe(&shared, &request, &value, generation)?;
-            }
-            // Results/events already use canonical current identities, never inverse string rewriting.
-            output
-                .lock()
-                .map_err(|_| "relay output mutex poisoned")?
-                .write_all(&bytes)?;
+            deliver(&output, &bytes, &shared, request, &value, generation)?;
         }
         Ok(())
     })();
@@ -284,6 +288,43 @@ fn connection(mut client: UnixStream, shared: Shared) -> Result<()> {
     let _ = upstream.shutdown(Shutdown::Both);
     let _ = writer.join();
     result
+}
+
+/// Writes one upstream reply to its client, then records what the request completed. A
+/// client gone before its reply (EPIPE, write timeout) still has the completion recorded; the
+/// write error follows the bookkeeping.
+fn deliver(
+    output: &Mutex<UnixStream>,
+    bytes: &[u8],
+    shared: &Shared,
+    request: Option<Value>,
+    value: &Value,
+    generation: u64,
+) -> Result<()> {
+    // Results/events already use canonical current identities, never inverse string rewriting.
+    let written: Result<()> = match output.lock() {
+        Ok(mut output) => output.write_all(bytes).map_err(Into::into),
+        Err(_) => fail("relay output mutex poisoned"),
+    };
+    // Bookkeeping follows the reply: its failure never costs the reply or the connection.
+    if let Some(request) = request {
+        if let Err(error) = observe(shared, &request, value, generation) {
+            eprintln!("herdr-shield: API relay bookkeeping failed: {error}");
+        }
+    }
+    written
+}
+
+/// The live session snapshot alias verification reads. Only its ID strings are read, so a
+/// field the pinned schema lacks never discards it.
+fn census(result: Option<Value>) -> Option<Value> {
+    let result = result?;
+    if serde_json::from_value::<schema::ResponseResult>(result.clone()).is_err() {
+        eprintln!(
+            "herdr-shield: session.snapshot differs from the pinned v22 schema; reading its IDs"
+        );
+    }
+    result.get("snapshot").cloned()
 }
 
 fn validate_response(value: &Value) -> Result<()> {
@@ -324,7 +365,7 @@ fn observe(shared: &Shared, request: &Value, response: &Value, generation: u64) 
         }
         state.meta.state = "terminated".into();
         state.meta.reason = "intentional-pane-close (completed authenticated relay request)".into();
-        state.meta.save(&state.paths)?;
+        state.persist();
         state.stopping = true;
     }
     Ok(())
@@ -348,8 +389,8 @@ mod tests {
         sender.write_all(&[5, 0, 0, 0, 22]).unwrap();
         assert!(client_line(&mut BufReader::new(receiver)).is_err());
     }
-    #[test]
-    fn newer_no_argv_report_prevents_stale_fallback_capture() {
+    /// A holder bound to pane w1:p1 with its private root under the temp dir.
+    fn holder(name: &str) -> Shared {
         use crate::{
             config::{Paths, random_id, secure_dir},
             holder::{
@@ -359,7 +400,7 @@ mod tests {
             lifetime::identity::Identity,
             terminal::{Size, Terminal},
         };
-        let root = std::env::temp_dir().join(format!("report-{}", random_id().unwrap()));
+        let root = std::env::temp_dir().join(format!("{name}-{}", random_id().unwrap()));
         secure_dir(&root).unwrap();
         let paths = Paths {
             home: root.clone(),
@@ -374,7 +415,7 @@ mod tests {
             workspace: "w1".into(),
             server: Identity::read(std::process::id()).unwrap(),
         };
-        let shared = Arc::new(Mutex::new(State {
+        Arc::new(Mutex::new(State {
             paths,
             meta: Metadata::new(binding, "/".into()).unwrap(),
             terminal: Arc::new(Mutex::new(Terminal::new(Size::new(24, 80).unwrap()))),
@@ -383,7 +424,11 @@ mod tests {
             child: None,
             lease: None,
             stopping: false,
-        }));
+        }))
+    }
+    #[test]
+    fn newer_no_argv_report_prevents_stale_fallback_capture() {
+        let shared = holder("report");
         observe(&shared,&json!({"method":"pane.report_agent","params":{"pane_id":"w1:p1","source":"custom:dummy","agent":"dummy","seq":2}}),&json!({"result":{"type":"ok"}}),1).unwrap();
         observe(&shared,&json!({"method":"pane.report_agent","params":{"pane_id":"w1:p1","source":"custom:dummy","agent":"dummy","seq":1,"resume_argv":["dummy","stale"]}}),&json!({"result":{"type":"ok"}}),1).unwrap();
         assert!(
@@ -392,12 +437,57 @@ mod tests {
         );
     }
     #[test]
+    fn a_completed_close_whose_client_is_gone_still_stops_the_holder() {
+        let shared = holder("close");
+        let root = shared.lock().unwrap().paths.state.clone();
+        // An unwritable registry costs the record, never the stop.
+        std::fs::write(root.join("not-a-directory"), b"").unwrap();
+        shared.lock().unwrap().paths.state = root.join("not-a-directory");
+        let (gone, client) = UnixStream::pair().unwrap();
+        drop(client);
+        let error = deliver(
+            &Mutex::new(gone),
+            b"{\"id\":\"close\",\"result\":{\"type\":\"ok\"}}\n",
+            &shared,
+            Some(json!({"method":"pane.close","params":{"pane_id":"w1:p1"}})),
+            &json!({"id":"close","result":{"type":"ok"}}),
+            1,
+        )
+        .unwrap_err();
+        assert_eq!(error.to_string(), "Broken pipe (os error 32)");
+        let state = shared.lock().unwrap();
+        assert_eq!(
+            (
+                state.meta.state.as_str(),
+                state.meta.reason.as_str(),
+                state.stopping
+            ),
+            (
+                "terminated",
+                "intentional-pane-close (completed authenticated relay request)",
+                true
+            )
+        );
+        drop(state);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
     fn native_resume_constraints_are_not_silently_normalized() {
         assert!(valid_resume(&["dummy".into(), "a b".into(), "".into()]));
         assert!(!valid_resume(&["/dummy".into()]));
         assert!(!valid_resume(&["dummy".into(), "a'b".into()]));
         assert!(!valid_resume(&[]));
     }
+    #[test]
+    fn census_snapshot_with_an_unpinned_field_still_verifies_aliases() {
+        let snapshot = json!({"panes":[{"pane_id":"w1:p1","future":true}],"tabs":[{"tab_id":"w1:t1"}],"workspaces":[{"workspace_id":"w1"}],"future":1});
+        assert_eq!(
+            census(Some(json!({"type":"session_snapshot","snapshot":snapshot}))),
+            Some(snapshot)
+        );
+        assert_eq!(census(None), None);
+    }
+
     #[test]
     fn malformed_unknown_and_untyped_results_fail_visibly() {
         assert!(validate_response(&json!({"id":"1","result":{"type":"unknown"}})).is_err());

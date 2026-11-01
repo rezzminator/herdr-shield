@@ -39,6 +39,7 @@ impl Paths {
 
     pub fn config(&self) -> Result<Config> {
         let config: Config = read_json(&self.config.join("config.json"))?;
+        config.warn_ignored();
         config.validate()?;
         Ok(config)
     }

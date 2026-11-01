@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 """Prove formatting, lint and assertion gates reject broken production-source copies."""
+import contextlib
+import io
 import os
 import pathlib
 import shutil
@@ -9,7 +11,7 @@ import tempfile
 import sys
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
-from gate_run import run
+from gate_run import cleanup, run
 
 source = pathlib.Path(__file__).resolve().parents[1]
 if not os.environ.get('HERDR_SHIELD_BUILD_ROOT') or not os.environ.get('TMPDIR'):
@@ -24,6 +26,15 @@ for name in ('Cargo.toml', 'Cargo.lock', 'rust-toolchain.toml'):
     shutil.copyfile(source / name, scratch / name)
 for directory in ('src', 'tests'):
     shutil.copytree(source / directory, scratch / directory)
+ledger = scratch / 'ledger-control'
+ledger.mkdir(mode=0o700)
+(ledger / 'owned-resources.jsonl').write_text('{"id":"broken\n{}\n12\n[]\n')
+captured = io.StringIO()
+with contextlib.redirect_stdout(captured):
+    cleanup(ledger)
+assert captured.getvalue() == ('CLEANUP ledger skipped 3 line(s) that are not a JSON object\n'
+                               'CLEANUP gate process/unit/socket survivors: []\n'), captured.getvalue()
+print('CONTROL rejected: a ledger line that is not a JSON object costs only itself', flush=True)
 target = scratch / 'src/main.rs'
 original = target.read_text()
 controls = [
@@ -71,8 +82,8 @@ try:
     for name, relative, old, new, test, expected in [
         ('query-delivery-regression', 'src/holder/state.rs', 'let query_writer = query_sender;', 'let query_writer = writer.clone();',
          'saturated_detached_query_replies_are_delivered_exactly_once', 'assertion `left == right` failed'),
-        ('recursive-shell-regression', 'src/attach/mod.rs', 'return recovery::plain(&config, "recursive keeper refused");',
-         'return fail("recursive keeper refused");', 'failed_manager_cgroup_native_resume_and_recursive_launch_open_plain_shell', 'recursive:'),
+        ('plain-shell-regression', 'src/attach/mod.rs', 'Err(error) => return recovery::plain(&config, &error.to_string()),',
+         'Err(error) => return Err(error),', 'failed_manager_cgroup_native_resume_and_recursive_launch_open_plain_shell', 'manager:'),
     ]:
         path = scratch / relative
         saved = path.read_text()

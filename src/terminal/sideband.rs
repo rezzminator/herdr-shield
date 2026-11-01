@@ -11,9 +11,15 @@ pub struct Strings {
     kind: u8,
     escaped: bool,
     overflow: bool,
+    length: usize,
+    /// The last string dropped for its length, shown in holder status.
+    pub discarded: Option<String>,
 }
 impl Strings {
     pub fn byte(&mut self, byte: u8) -> Option<Vec<u8>> {
+        if self.kind > 1 {
+            self.length += 1;
+        }
         if self.kind == 0 {
             if byte == 27 {
                 self.kind = 1;
@@ -26,6 +32,7 @@ impl Strings {
             self.pending.push(byte);
             if matches!(byte, b']' | b'P' | b'_' | b'^' | b'X') {
                 self.kind = byte;
+                self.length = 2;
                 return None;
             }
             self.kind = 0;
@@ -54,6 +61,19 @@ impl Strings {
         }
         self.escaped = byte == 27;
         if done {
+            if self.overflow {
+                let kind = match self.kind {
+                    b']' => "OSC",
+                    b'P' => "DCS",
+                    b'_' => "APC",
+                    b'^' => "PM",
+                    _ => "SOS",
+                };
+                self.discarded = Some(format!(
+                    "discarded an over-long {kind} string of {} bytes",
+                    self.length
+                ));
+            }
             self.kind = 0;
             self.escaped = false;
             let result = (!self.overflow).then(|| std::mem::take(&mut self.pending));
@@ -94,6 +114,8 @@ pub struct Sideband {
     events: VecDeque<(u64, String)>,
     cwd: Option<String>,
     title: Option<String>,
+    /// The newest clipboard write and its sequence, replayed only across a gap inside one attachment.
+    clipboard: Option<(u64, String)>,
 }
 pub fn safe_text(text: &str, max: usize) -> bool {
     text.len() <= max && !text.chars().any(char::is_control)
@@ -114,6 +136,7 @@ pub fn safe_uri(text: &str) -> bool {
 impl Sideband {
     pub fn reset(&mut self) {
         self.cwd = None;
+        self.clipboard = None;
         self.title = Some(String::new());
         self.sequence += 1;
         self.events.clear();
@@ -155,10 +178,11 @@ impl Sideband {
                     col + 1
                 ))
             }
-            // A live write reaches the attached pane, as it would unwrapped; since()
-            // never replays it on reconnect, so detached output cannot reach the
-            // outer clipboard. A newer write supersedes one not yet delivered; the
-            // older event stays, emptied, so its sequence never reads as a gap.
+            // A live write reaches the attached pane, as it would unwrapped. since()
+            // replays the newest write only across a gap inside the attachment that
+            // has not yet received it, never on reconnect, so detached output cannot
+            // reach the outer clipboard. A newer write supersedes one not yet delivered;
+            // the older event stays, emptied, so its sequence never reads as a gap.
             "52" if clipboard_write(value) => {
                 for (_, event) in &mut self.events {
                     if event.as_bytes().starts_with(CLIPBOARD) {
@@ -171,6 +195,9 @@ impl Sideband {
         };
         if let Some(approved) = approved {
             self.sequence += 1;
+            if approved.as_bytes().starts_with(CLIPBOARD) {
+                self.clipboard = Some((self.sequence, approved.clone()));
+            }
             self.events.push_back((self.sequence, approved));
             if self.events.len() > 256 {
                 self.events.pop_front();
@@ -192,6 +219,12 @@ impl Sideband {
                 self.title
                     .as_ref()
                     .map(|value| format!("\x1b]2;{value}\x1b\\")),
+                // A write this attachment has not received survives a gap; a reconnect
+                // (no `after`) never replays one.
+                self.clipboard
+                    .as_ref()
+                    .filter(|(sequence, _)| after.is_some_and(|after| *sequence > after))
+                    .map(|(_, value)| value.clone()),
             ]
             .into_iter()
             .flatten()
@@ -242,6 +275,25 @@ mod tests {
         assert_eq!(behind["gap"], false);
         assert_eq!(behind["data"], "\x1b]52;c;U0VDUkVU\x1b\\");
         assert_eq!(sideband.since(Some(6))["data"], "");
+        for _ in 0..300 {
+            sideband.control(b"\x1b]133;A\x07", 1, 2);
+        }
+        let behind = sideband.since(Some(4));
+        assert_eq!(behind["gap"], true);
+        assert_eq!(
+            behind["data"], "\x1b]7;file:///work\x1b\\\x1b]2;title\x1b\\\x1b]52;c;U0VDUkVU\x1b\\",
+            "a gap keeps the undelivered clipboard write"
+        );
+        assert_eq!(
+            sideband.since(Some(6))["data"],
+            "\x1b]7;file:///work\x1b\\\x1b]2;title\x1b\\",
+            "a delivered clipboard write is never replayed"
+        );
+        assert_eq!(
+            sideband.since(None)["data"],
+            "\x1b]7;file:///work\x1b\\\x1b]2;title\x1b\\",
+            "reconnect replays no clipboard write"
+        );
     }
     #[test]
     fn clipboard_write_needs_decodable_base64_and_xterm_targets() {
@@ -276,6 +328,10 @@ mod tests {
             assert!(filter.pending.len() <= 4096);
         }
         assert!(filter.byte(7).is_none());
+        assert_eq!(
+            filter.discarded.as_deref(),
+            Some("discarded an over-long OSC string of 100005 bytes")
+        );
         assert_eq!(filter.byte(b'X'), Some(vec![b'X']));
         for (length, kept) in [(CLIPBOARD_MAX - 8, true), (CLIPBOARD_MAX - 7, false)] {
             let mut write = b"\x1b]52;c;".to_vec();

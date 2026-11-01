@@ -61,7 +61,7 @@ pub fn serve(paths: Paths, id: &str) -> Result<()> {
             if state.child.is_none() && Instant::now() > bootstrap_deadline {
                 state.meta.state = "unprotected".into();
                 state.meta.reason = "unbootstrapped holder expired; no workload started".into();
-                state.meta.save(&state.paths)?;
+                state.persist();
                 state.stopping = true;
                 break;
             }
@@ -74,7 +74,7 @@ pub fn serve(paths: Paths, id: &str) -> Result<()> {
                             status.exit_code(),
                             status.signal()
                         );
-                        state.meta.save(&state.paths)?;
+                        state.persist();
                     }
                 }
             }
@@ -97,7 +97,11 @@ pub fn serve(paths: Paths, id: &str) -> Result<()> {
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                 std::thread::sleep(Duration::from_millis(15))
             }
-            Err(e) => return Err(e.into()),
+            // A failed accept (EMFILE, ECONNABORTED) costs that connection, never the holder.
+            Err(e) => {
+                eprintln!("herdr-shield: holder accept failed: {e}; still serving");
+                std::thread::sleep(Duration::from_millis(100));
+            }
         }
     }
     fs::remove_file(dir.join("holder.sock"))?;
@@ -277,7 +281,7 @@ fn dispatch(state: &mut State, owner: &str, frame: &Frame) -> Result<(&'static s
                 .terminal
                 .lock()
                 .map_err(|_| "terminal mutex poisoned")?;
-            json!({"id":state.meta.id,"version":state.meta.version,"child":state.meta.child,"state":state.meta.state,"attached":state.lease.is_some(),"reason":state.meta.reason,"binding":state.meta.binding,"generation":state.meta.generation,"resume_status":state.meta.resume_status,"features":["binding-proof-v1","terminal-sideband-v1","theme-v1"],"terminal":{"theme_policy":terminal.theme_policy,"query_error":terminal.query_error,"sideband_policy":"bounded audited OSC7 cwd, OSC133 boundaries, OSC0/2 title, live OSC52 clipboard writes; reconnect restores latest cwd/title, not historical commands or clipboard writes","sideband_sequence":terminal.sideband.sequence},"cleanup":format!("herdr-shield kill {}",state.meta.id)})
+            json!({"id":state.meta.id,"version":state.meta.version,"child":state.meta.child,"state":state.meta.state,"attached":state.lease.is_some(),"reason":state.meta.reason,"binding":state.meta.binding,"generation":state.meta.generation,"resume_status":state.meta.resume_status,"features":["binding-proof-v1","terminal-sideband-v1","theme-v1"],"terminal":{"theme_policy":terminal.theme_policy,"query_error":terminal.query_error,"discarded_string":terminal.strings.discarded,"sideband_policy":"bounded audited OSC7 cwd, OSC133 boundaries, OSC0/2 title, live OSC52 clipboard writes; reconnect restores latest cwd/title, not historical commands or clipboard writes","sideband_sequence":terminal.sideband.sequence},"cleanup":format!("herdr-shield kill {}",state.meta.id)})
         })),
         "detach" => {
             state.detached(owner)?;
@@ -302,7 +306,8 @@ fn dispatch(state: &mut State, owner: &str, frame: &Frame) -> Result<(&'static s
             }
             state.meta.state = "terminated".into();
             state.meta.reason = "explicit confirmed kill".into();
-            state.meta.save(&state.paths)?;
+            // A record that cannot be written never keeps a holder serving a killed child.
+            state.persist();
             state.stopping = true;
             Ok(("terminated", json!({})))
         }

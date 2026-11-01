@@ -71,19 +71,44 @@ fn size() -> (u16, u16) {
 }
 
 pub fn default_shell(paths: &Paths) -> Result<()> {
-    let config = paths.config()?;
-    if std::env::var_os("HERDR_SHIELD_INNER").is_some() {
-        return recovery::plain(&config, "recursive keeper refused");
-    }
-    let binding = match crate::herdr::binding() {
-        Ok(value) => value,
+    let config = match paths.config() {
+        Ok(config) => config,
+        Err(error) => {
+            return recovery::plain(
+                &recovery::fallback(),
+                &format!("configuration unusable: {error}"),
+            );
+        }
+    };
+    // A pane always gets a shell: every bootstrap failure opens the plain shell.
+    let (mut meta, binding) = match bootstrap(paths) {
+        Ok(found) => found,
         Err(error) => return recovery::plain(&config, &error.to_string()),
     };
-    if let Err(error) = crate::herdr::prerequisites(paths) {
-        return recovery::plain(&config, &error.to_string());
+    match run(paths, &mut meta, Some(binding), false) {
+        Err(error) if error.to_string().contains("invalid_binding") => {
+            recovery::plain(&config, &error.to_string())
+        }
+        result => result,
     }
+}
+
+/// This pane's verified holder, found or created; any failure leaves no new holder serving.
+fn bootstrap(paths: &Paths) -> Result<(Metadata, registry::Binding)> {
+    if std::env::var_os("HERDR_SHIELD_INNER").is_some() {
+        return fail("recursive keeper refused");
+    }
+    let binding = crate::herdr::binding()?;
+    crate::herdr::prerequisites(paths)?;
     let lock = registry::lock(paths)?;
-    let candidates: Vec<_> = Metadata::all(paths)?
+    let (holders, unreadable) = Metadata::all(paths)?;
+    if let Some(record) = unreadable.iter().find(|record| record.may_bind(&binding)) {
+        return fail(&format!(
+            "invalid_binding: unreadable holder record {} may own this pane ({}); retained, no duplicate created",
+            record.id, record.error
+        ));
+    }
+    let candidates: Vec<_> = holders
         .into_iter()
         .filter(|meta| {
             meta.binding.socket == binding.socket
@@ -94,22 +119,22 @@ pub fn default_shell(paths: &Paths) -> Result<()> {
     if candidates.len() > 1 {
         return fail("invalid_binding: ambiguous existing holders; retained, no duplicate created");
     }
-    let mut meta = if let Some(meta) = candidates.into_iter().next() {
+    let meta = if let Some(meta) = candidates.into_iter().next() {
         meta
     } else {
         let mut meta = Metadata::new(binding.clone(), std::env::current_dir()?)?;
         let (rows, cols) = size();
-        let env = std::env::vars_os()
-            .map(|(key, value)| {
-                Ok((
-                    key.into_string()
-                        .map_err(|_| "non-UTF8 environment key cannot bootstrap safely")?,
-                    value
-                        .into_string()
-                        .map_err(|_| "non-UTF8 environment value cannot bootstrap safely")?,
-                ))
-            })
-            .collect::<Result<Vec<_>>>()?;
+        let mut env = Vec::new();
+        for (key, value) in std::env::vars_os() {
+            match (key.to_str(), value.to_str()) {
+                (Some(key), Some(value)) => env.push((key.to_owned(), value.to_owned())),
+                // The holder takes UTF-8 only; one such variable costs itself, never the shell.
+                _ => eprintln!(
+                    "herdr-shield: skipped non-UTF-8 environment variable {}",
+                    key.to_string_lossy()
+                ),
+            }
+        }
         let request = Frame::new(
             &meta.id,
             "spawn",
@@ -121,35 +146,31 @@ pub fn default_shell(paths: &Paths) -> Result<()> {
             })?,
         );
         if let Err(error) = crate::lifetime::systemd::launch(paths, &mut meta) {
-            let reason = error.to_string();
             meta.state = "unprotected".into();
-            meta.reason = reason.clone();
+            meta.reason = error.to_string();
             meta.save(paths)?;
-            drop(lock);
-            return recovery::plain(&config, &reason);
+            return Err(error);
         }
         if let Err(error) = holder::client(paths, &meta)
             .and_then(|mut client| protocol::exchange(&mut client, &request))
         {
-            crate::lifetime::systemd::stop(&meta)?;
             meta.state = "unprotected".into();
             meta.reason = format!("bootstrap refused: {error}");
+            if let Err(stop) = crate::lifetime::systemd::stop(&meta) {
+                // The unbootstrapped holder expires on its own and then records its own reason;
+                // the stop failure reaches the caller in this error.
+                meta.reason = format!("{}; stop failed: {stop}", meta.reason);
+            }
             meta.save(paths)?;
-            drop(lock);
-            return recovery::plain(&config, &meta.reason);
+            return fail(&meta.reason);
         }
         Metadata::load(paths, &meta.id)?
     };
     drop(lock);
     if meta.state == "unprotected" {
-        return recovery::plain(&config, &meta.reason);
+        return fail(&meta.reason);
     }
-    match run(paths, &mut meta, Some(binding), false) {
-        Err(error) if error.to_string().contains("invalid_binding") => {
-            recovery::plain(&config, &error.to_string())
-        }
-        result => result,
-    }
+    Ok((meta, binding))
 }
 
 pub fn existing(paths: &Paths, id: &str) -> Result<()> {
@@ -213,7 +234,8 @@ fn run(
     let mut input_activity = Instant::now();
     let mut sequence = 0u64;
     let mut previous_size = (0, 0);
-    let mut previous_revision = 0;
+    let mut previous_revision = None;
+    let mut discarding = false;
     let mut next_render = Instant::now();
     let mut sideband_after = None;
     let result = (|| -> Result<()> {
@@ -266,55 +288,36 @@ fn run(
                     },
                 );
                 protocol::write(&mut stream, &request)?;
-                let mut bytes = Vec::new();
-                let mut expected = 0u64;
-                let final_frame = loop {
-                    let frame = protocol::read(&mut stream)?;
-                    if frame.kind != "render"
-                        || frame.payload["sequence"].as_u64() != Some(expected)
-                    {
-                        return fail("snapshot gap or stale_generation; reconnect required");
+                let Some((final_frame, bytes)) = read_snapshot(&mut stream)? else {
+                    if !discarding {
+                        eprintln!(
+                            "herdr-shield: discarded a snapshot with a chunk gap or checksum mismatch; requesting a fresh one"
+                        );
                     }
-                    bytes.extend_from_slice(
-                        &B64.decode(
-                            frame.payload["data"]
-                                .as_str()
-                                .ok_or("snapshot data missing")?,
-                        )?,
-                    );
-                    if bytes.len() > 8 * 1024 * 1024 {
-                        return fail("snapshot resource limit");
-                    }
-                    expected += 1;
-                    if frame.payload["total"].as_u64() == Some(expected) {
-                        break frame;
-                    }
+                    discarding = true;
+                    previous_revision = None;
+                    next_render = Instant::now() + Duration::from_millis(40);
+                    continue;
                 };
+                discarding = false;
                 if final_frame.generation != generation {
                     (token, generation) = acquire(&mut stream, &meta.id)?;
-                    previous_revision = 0;
+                    previous_revision = None;
                     if final_frame.generation != generation {
                         continue;
                     }
                 }
-                if final_frame.payload["checksum"].as_str()
-                    != Some(&format!("{:x}", Sha256::digest(&bytes)))
-                {
-                    return fail("snapshot checksum mismatch");
-                }
-                let revision = final_frame.payload["revision"]
-                    .as_u64()
-                    .ok_or("snapshot revision missing")?;
+                let revision = final_frame.payload["revision"].as_u64();
                 if final_frame.payload["sideband"]["gap"] == true {
                     eprintln!(
-                        "herdr-shield: sideband history gap; restored latest cwd/title without replaying historical command markers"
+                        "herdr-shield: sideband history gap; restored latest cwd/title and any undelivered clipboard write without replaying historical command markers"
                     );
                 }
                 if let Some(data) = final_frame.payload["sideband"]["data"].as_str() {
                     std::io::stdout().write_all(data.as_bytes())?;
                 }
                 sideband_after = final_frame.payload["sideband"]["sequence"].as_u64();
-                if revision != previous_revision {
+                if redraw(previous_revision, revision) {
                     std::io::stdout().write_all(&bytes)?;
                     std::io::stdout().flush()?;
                     previous_revision = revision;
@@ -388,6 +391,50 @@ fn run(
     Ok(())
 }
 
+/// One snapshot reply read whole. `None` discards a reply with a chunk gap or a checksum
+/// mismatch; either way the stream is left at the next reply.
+fn read_snapshot(stream: &mut impl Read) -> Result<Option<(Frame, Vec<u8>)>> {
+    let mut bytes = Vec::new();
+    let mut expected = 0u64;
+    let mut intact = true;
+    loop {
+        let frame = protocol::read(stream)?;
+        if frame.kind != "render" {
+            return fail(&format!(
+                "snapshot refused; reconnect required: {}",
+                frame.payload
+            ));
+        }
+        let sequence = frame.payload["sequence"].as_u64();
+        intact &= sequence == Some(expected);
+        if intact {
+            bytes.extend_from_slice(
+                &B64.decode(
+                    frame.payload["data"]
+                        .as_str()
+                        .ok_or("snapshot data missing")?,
+                )?,
+            );
+            if bytes.len() > 8 * 1024 * 1024 {
+                return fail("snapshot resource limit");
+            }
+        }
+        expected += 1;
+        // The last chunk names itself, so a reply with a gap is still read to its end.
+        let total = frame.payload["total"].as_u64();
+        if total.is_some() && sequence.map(|sequence| sequence + 1) == total {
+            let matches = frame.payload["checksum"].as_str()
+                == Some(&format!("{:x}", Sha256::digest(&bytes)));
+            return Ok((intact && matches).then_some((frame, bytes)));
+        }
+    }
+}
+
+/// Redraw on a new revision; a snapshot without one always redraws.
+fn redraw(previous: Option<u64>, revision: Option<u64>) -> bool {
+    revision.is_none() || revision != previous
+}
+
 fn acquire(stream: &mut std::os::unix::net::UnixStream, id: &str) -> Result<(String, u64)> {
     let lease = protocol::exchange(stream, &Frame::new(id, "acquire", json!({})))?;
     Ok((
@@ -417,4 +464,88 @@ fn mutate(
         }
     }
     fail("stale_generation: binding changed repeatedly; reattach")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn reply(chunks: &[(u64, &str)], total: u64, whole: &str) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        for (sequence, data) in chunks {
+            let frame = Frame::new(
+                &"a".repeat(32),
+                "render",
+                json!({"sequence":sequence,"total":total,"data":B64.encode(data),"checksum":format!("{:x}", Sha256::digest(whole))}),
+            );
+            protocol::write(&mut bytes, &frame).unwrap();
+        }
+        bytes
+    }
+
+    #[test]
+    fn snapshot_gap_or_checksum_mismatch_discards_one_reply_and_keeps_the_stream() {
+        for (name, first, expected) in [
+            (
+                "intact",
+                reply(&[(0, "hel"), (1, "lo")], 2, "hello"),
+                Some("hello"),
+            ),
+            (
+                "chunk gap",
+                reply(&[(0, "hel"), (2, "lo")], 3, "hello"),
+                None,
+            ),
+            (
+                "checksum mismatch",
+                reply(&[(0, "hel"), (1, "lo")], 2, "other"),
+                None,
+            ),
+        ] {
+            let mut stream =
+                std::io::Cursor::new([first, reply(&[(0, "next")], 1, "next")].concat());
+            let text = |snapshot: Option<(Frame, Vec<u8>)>| {
+                snapshot.map(|(_, bytes)| String::from_utf8(bytes).unwrap())
+            };
+            assert_eq!(
+                text(read_snapshot(&mut stream).unwrap()).as_deref(),
+                expected,
+                "{name}"
+            );
+            assert_eq!(
+                text(read_snapshot(&mut stream).unwrap()).as_deref(),
+                Some("next"),
+                "{name}: the following reply must be read intact"
+            );
+        }
+        let mut refused = Vec::new();
+        protocol::write(
+            &mut refused,
+            &Frame::new(&"a".repeat(32), "snapshot", json!({})).error("invalid_frame", "bad"),
+        )
+        .unwrap();
+        assert_eq!(
+            read_snapshot(&mut std::io::Cursor::new(refused))
+                .unwrap_err()
+                .to_string(),
+            r#"snapshot refused; reconnect required: {"code":"invalid_frame","message":"bad"}"#
+        );
+    }
+
+    #[test]
+    fn snapshot_without_revision_redraws() {
+        for (previous, revision, expected) in [
+            (None, Some(1), true),
+            (Some(1), Some(1), false),
+            (Some(1), Some(2), true),
+            (Some(1), None, true),
+            (None, None, true),
+        ] {
+            assert_eq!(
+                redraw(previous, revision),
+                expected,
+                "{previous:?} -> {revision:?}"
+            );
+        }
+    }
 }

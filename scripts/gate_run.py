@@ -15,16 +15,32 @@ def live(record):
         return False
 
 
+def json_object(text):
+    """The JSON object text holds, or None when it holds none."""
+    try:
+        value = json.loads(text)
+    except json.JSONDecodeError:
+        return None
+    return value if isinstance(value, dict) else None
+
+
 def cleanup(root):
     records = []
     ledger = root / 'owned-resources.jsonl'
     if ledger.exists():
-        records.extend(json.loads(line) for line in ledger.read_text().splitlines())
+        unparsed = 0
+        for line in ledger.read_text().splitlines():
+            # One bad ledger line costs that line, never the cleanup.
+            if (value := json_object(line)) is None:
+                unparsed += 1
+            else:
+                records.append(value)
+        if unparsed:
+            print(f'CLEANUP ledger skipped {unparsed} line(s) that are not a JSON object', flush=True)
     for path in (root / 'state/herdr-shield').glob('*.json'):
-        try:
-            records.append(json.loads(path.read_text()))
-        except json.JSONDecodeError:
-            pass  # The independent ownership ledger survives deliberate registry corruption.
+        # The independent ownership ledger survives deliberate registry corruption.
+        if (value := json_object(path.read_text())) is not None:
+            records.append(value)
     units = set()
     identities = []
     for record in records:

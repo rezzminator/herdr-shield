@@ -2,7 +2,7 @@ use std::io::{Read, Write};
 use std::os::unix::process::CommandExt;
 
 use crate::config::{Config, command};
-use crate::holder::registry::Metadata;
+use crate::holder::registry::{Metadata, Resume};
 use crate::lifetime::identity::{Identity, Life};
 use crate::{Result, fail};
 
@@ -15,6 +15,32 @@ pub fn display(argv: &[String]) -> Result<String> {
         return fail("invalid captured argv");
     }
     Ok(serde_json::to_string(argv)?)
+}
+
+/// The plain shell when config.json is unusable: `$SHELL` when it validates, else /bin/sh.
+pub fn fallback() -> Config {
+    std::env::var_os("SHELL")
+        .map(|shell| Config {
+            shell: shell.into(),
+            ..Config::default()
+        })
+        .filter(|config| config.validate().is_ok())
+        .unwrap_or_else(|| Config {
+            shell: "/bin/sh".into(),
+            ..Config::default()
+        })
+}
+
+/// The argv line shown after holder loss and whether Enter may run it; an argv that
+/// cannot be shown is never offered.
+fn offer(meta: &Metadata, resume: &Resume) -> (String, bool) {
+    match display(&resume.argv) {
+        Ok(text) => (
+            text,
+            meta.resume.is_some() && can_resume(resume.process.as_ref()),
+        ),
+        Err(error) => (format!("unavailable ({error})"), false),
+    }
 }
 
 pub fn plain(config: &Config, reason: &str) -> Result<()> {
@@ -44,8 +70,8 @@ pub fn missing(meta: &Metadata, config: &Config, cause: &str) -> Result<()> {
         drop(raw);
         return plain(config, "holder missing; no captured resume argv");
     };
-    println!("captured resume argv: {}\r", display(&resume.argv)?);
-    let allowed = meta.resume.is_some() && can_resume(resume.process.as_ref());
+    let (shown, allowed) = offer(meta, resume);
+    println!("captured resume argv: {shown}\r");
     if allowed {
         print!(
             "Original process independently proven gone. Enter runs the exact argv once; any other key opens a plain shell.\r\n"
@@ -92,6 +118,45 @@ mod tests {
         assert_eq!(serde_json::from_str::<Vec<String>>(&text).unwrap(), argv);
         assert!(!text.contains('\x1b'));
         assert!(display(&["a\0b".into()]).is_err());
+    }
+
+    #[test]
+    fn undisplayable_captured_argv_is_shown_unavailable_and_never_offered() {
+        let binding = crate::holder::registry::Binding {
+            socket: "/socket".into(),
+            pane: "w1:p1".into(),
+            tab: "w1:t1".into(),
+            workspace: "w1".into(),
+            server: Identity::read(std::process::id()).unwrap(),
+        };
+        let mut meta = Metadata::new(binding, "/".into()).unwrap();
+        let mut child = crate::config::command("/bin/sh")
+            .args(["-c", "exit 0"])
+            .spawn()
+            .unwrap();
+        let exited = Identity::read(child.id()).unwrap();
+        child.wait().unwrap();
+        for (argv, expected) in [
+            (vec!["dummy".to_owned()], (r#"["dummy"]"#.to_owned(), true)),
+            (
+                vec![],
+                ("unavailable (invalid captured argv)".to_owned(), false),
+            ),
+            (
+                vec!["a\0b".to_owned()],
+                ("unavailable (invalid captured argv)".to_owned(), false),
+            ),
+        ] {
+            let resume = Resume {
+                argv,
+                process: Some(exited.clone()),
+                source: "custom:dummy".into(),
+                agent: "dummy".into(),
+                seq: None,
+            };
+            meta.resume = Some(resume.clone());
+            assert_eq!(offer(&meta, &resume), expected);
+        }
     }
 
     #[test]

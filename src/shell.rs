@@ -9,15 +9,27 @@ pub fn command(program: impl AsRef<std::ffi::OsStr>) -> std::process::Command {
     std::process::Command::new(program)
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Config {
     pub shell: PathBuf,
     #[serde(default)]
     pub args: Vec<String>,
+    /// Keys this version does not know: warned about, never a refusal of the shell.
+    #[serde(flatten, skip_serializing)]
+    pub ignored: std::collections::BTreeMap<String, serde_json::Value>,
 }
 
 impl Config {
+    pub fn warn_ignored(&self) {
+        if !self.ignored.is_empty() {
+            let keys: Vec<_> = self.ignored.keys().map(String::as_str).collect();
+            eprintln!(
+                "herdr-shield: ignoring unknown configuration keys: {}",
+                keys.join(", ")
+            );
+        }
+    }
+
     pub fn validate(&self) -> Result<()> {
         let shell = fs::canonicalize(&self.shell)?;
         if !self.shell.is_absolute()
@@ -49,7 +61,7 @@ mod tests {
     fn explicit_shell_rejects_self_alias_and_nul() {
         let mut config = Config {
             shell: std::env::current_exe().unwrap(),
-            args: vec![],
+            ..Config::default()
         };
         assert!(config.validate().is_err());
         config.shell = "/bin/sh".into();

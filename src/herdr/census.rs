@@ -32,7 +32,7 @@ pub fn pty_children(server: &Identity) -> Result<Vec<Identity>> {
     for pid in children {
         let stat = match fs::read_to_string(format!("/proc/{pid}/stat")) {
             Ok(stat) => stat,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) if vanished(&error) => continue,
             Err(error) => return Err(error.into()),
         };
         let (_, tail) = stat.rsplit_once(')').ok_or("malformed PTY process stat")?;
@@ -45,11 +45,9 @@ pub fn pty_children(server: &Identity) -> Result<Vec<Identity>> {
             && fields[4] != "0"
             && !matches!(fields[0], "Z" | "X")
         {
-            let identity = Identity::read(pid)?;
-            if identity.start != fields[19].parse::<u64>()? || identity.life() != Life::Live {
-                return fail("PTY process identity changed during census");
+            if let Some(identity) = settle(pid, fields[19].parse::<u64>()?)? {
+                result.push(identity);
             }
-            result.push(identity);
         }
     }
     if server.life() != Life::Live {
@@ -58,9 +56,50 @@ pub fn pty_children(server: &Identity) -> Result<Vec<Identity>> {
     Ok(result)
 }
 
+/// A PTY child's identity at its census stat read: `None` when it exited in between, an
+/// error when the PID now names another process.
+fn settle(pid: u32, start: u64) -> Result<Option<Identity>> {
+    let identity = match Identity::read(pid) {
+        Ok(identity) => identity,
+        Err(error) if error.downcast_ref().is_some_and(vanished) => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    if identity.start != start {
+        return fail("PTY process identity changed during census");
+    }
+    match identity.life() {
+        Life::Live => Ok(Some(identity)),
+        Life::Gone => Ok(None),
+        Life::Unknown => fail("PTY process identity changed during census"),
+    }
+}
+
+/// A /proc read that failed because the process exited.
+fn vanished(error: &std::io::Error) -> bool {
+    error.kind() == std::io::ErrorKind::NotFound || error.raw_os_error() == Some(nix::libc::ESRCH)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn census_skips_a_child_that_exits_and_refuses_a_changed_identity() {
+        let mut child = crate::config::command("/bin/sh")
+            .args(["-c", "exit 0"])
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        let start = Identity::read(pid).unwrap().start;
+        child.wait().unwrap();
+        assert_eq!(settle(pid, start).unwrap(), None, "exited child is skipped");
+        let own = Identity::read(std::process::id()).unwrap();
+        assert_eq!(settle(own.pid, own.start).unwrap(), Some(own.clone()));
+        assert_eq!(
+            settle(own.pid, own.start + 1).unwrap_err().to_string(),
+            "PTY process identity changed during census"
+        );
+    }
 
     #[test]
     fn census_rejects_reused_and_unknown_server_identity() {

@@ -171,8 +171,10 @@ text, argv, paths, tokens and agent names are never globally rewritten.
 Results remain canonical current identities. Binding changes interrupt streams
 with a stale-generation error so callers can resubscribe.
 
-Observed pane moves update the current binding. Binding history is capped at
-256; the plugin explicitly refuses new history at the cap. Historical aliases
+Observed pane moves update the current binding. Binding history keeps each
+distinct pane/tab/workspace ID triple once, so rebinding to known IDs never
+grows it; it is capped at 256 triples, and the plugin explicitly refuses new
+history at the cap. Historical aliases
 are refused when live/reused or when the census is unknown. Stock Herdr supplies
 no durable pane-instance token across deleted and recreated sessions, so cold
 automatic restore will not rebind: it retains the orphan, opens a plain shell,

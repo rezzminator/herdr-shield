@@ -2,8 +2,11 @@
 mod coverage;
 #[path = "../jail.rs"]
 mod jail;
+#[path = "plain_shell.rs"]
+mod plain_shell;
 
 use std::io::{Read, Write};
+use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixStream;
 use std::time::Duration;
 
@@ -140,6 +143,27 @@ fn black_box_holder_survives_attach_loss_leases_redraw_and_explicit_kill() {
         serde_json::from_slice::<Value>(&empty.stdout).unwrap()["enumeration"],
         "EMPTY"
     );
+    // An event hint the pinned schema lacks still runs the reconcile it asks for.
+    let hinted = jail
+        .command()
+        .arg("event")
+        .env(
+            "HERDR_PLUGIN_EVENT_JSON",
+            r#"{"event":"pane_closed","data":{"type":"pane_closed"}}"#,
+        )
+        .output()
+        .unwrap();
+    assert_eq!(
+        (
+            serde_json::from_slice::<Value>(&hinted.stdout).unwrap()["enumeration"].clone(),
+            String::from_utf8_lossy(&hinted.stderr).into_owned()
+        ),
+        (
+            json!("EMPTY"),
+            "herdr-shield: event hint outside the pinned v22 schema (missing field `pane_id` at line 1 column 53); reconciling anyway\n".into()
+        )
+    );
+    assert!(hinted.status.success());
     let failed = jail
         .command()
         .args(["reconcile"])
@@ -152,14 +176,121 @@ fn black_box_holder_survives_attach_loss_leases_redraw_and_explicit_kill() {
         "ERROR"
     );
     assert!(std::path::Path::new(&format!("/proc/{child}")).exists());
+    // An unreadable last-error record is shown as such; the listing goes on.
+    let last_error = jail.root.join("state/herdr-shield/last-error.json");
+    std::fs::set_permissions(&last_error, std::fs::Permissions::from_mode(0o644)).unwrap();
     let listed = jail.run(&["list", "--json"]);
-    assert!(listed.status.success());
+    std::fs::set_permissions(&last_error, std::fs::Permissions::from_mode(0o600)).unwrap();
+    assert!(
+        listed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&listed.stderr)
+    );
     let listing: Value = serde_json::from_slice(&listed.stdout).unwrap();
+    assert_eq!(
+        listing["previous_reconciliation_error"],
+        json!({"unreadable":"private file has unsafe ownership or permissions"})
+    );
     assert_eq!(listing["holders"][0]["id"], meta["id"]);
     assert_eq!(listing["holders"][0]["orphan"], true);
     assert_eq!(
         listing["holders"][0]["cleanup"],
         format!("herdr-shield kill {}", meta["id"].as_str().unwrap())
+    );
+    // Doctor names every unreadable record, and a reconcile that ends in their ERROR leaves
+    // the last failure record as it was rather than recording a success.
+    let unreadable = ["b", "c"].map(|digit| digit.repeat(32));
+    for id in &unreadable {
+        let record = jail.root.join(format!("state/herdr-shield/{id}.json"));
+        std::fs::write(&record, br#"{"schema":999}"#).unwrap();
+        std::fs::set_permissions(&record, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+    let failure = std::fs::read(&last_error).unwrap();
+    let earlier = r#"{"error":"earlier","action":"retry reconcile"}"#;
+    std::fs::write(&last_error, earlier).unwrap();
+    let doctor = jail.run(&["doctor"]);
+    let reconciled = jail.run(&["reconcile"]);
+    let [b, c] = &unreadable;
+    assert_eq!(
+        (
+            String::from_utf8_lossy(&doctor.stderr).into_owned(),
+            doctor.status.success(),
+            String::from_utf8_lossy(&reconciled.stderr).into_owned(),
+            reconciled.status.success(),
+            std::fs::read_to_string(&last_error).unwrap()
+        ),
+        (
+            format!(
+                "herdr-shield: ERROR: unreadable holder records retained: {b} (missing field `id` at line 1 column 14), {c} (missing field `id` at line 1 column 14)\n"
+            ),
+            false,
+            format!("herdr-shield: ERROR: unreadable holder records retained: {b}, {c}\n"),
+            false,
+            earlier.to_owned()
+        ),
+        "last failure record: {}",
+        last_error.display()
+    );
+    std::fs::write(&last_error, failure).unwrap();
+    for id in &unreadable {
+        std::fs::remove_file(jail.root.join(format!("state/herdr-shield/{id}.json"))).unwrap();
+    }
+    // Descriptor exhaustion fails accept(); the holder and its API relay keep serving.
+    let soft = std::fs::read_to_string(format!("/proc/{holder}/limits"))
+        .unwrap()
+        .lines()
+        .find_map(|line| line.strip_prefix("Max open files"))
+        .and_then(|limits| limits.split_whitespace().next().map(str::to_owned))
+        .unwrap();
+    let limit = |soft: &str| {
+        let output = std::process::Command::new("prlimit")
+            .args(["--pid", &holder.to_string(), &format!("--nofile={soft}:")])
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{:?}", output.stderr);
+    };
+    let switches = || {
+        std::fs::read_to_string(format!("/proc/{holder}/task/{holder}/status"))
+            .ok()?
+            .lines()
+            .find_map(|line| line.strip_prefix("voluntary_ctxt_switches:"))?
+            .trim()
+            .parse::<u64>()
+            .ok()
+    };
+    limit("3");
+    let mut queued = UnixStream::connect(&socket).unwrap();
+    let mut relay = UnixStream::connect(socket.with_file_name("herdr-api.sock")).unwrap();
+    let before = switches().unwrap();
+    wait(|| switches().is_none_or(|now| now >= before + 5));
+    assert!(
+        std::path::Path::new(&format!("/proc/{holder}")).exists(),
+        "holder exited on a failed accept"
+    );
+    limit(&soft);
+    queued
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    send(
+        &mut queued,
+        frame(&meta, "hello", 0, json!({"capability":meta["capability"]})),
+    );
+    assert_eq!(read(&mut queued)["type"], "welcome");
+    drop(queued);
+    relay
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    writeln!(
+        relay,
+        "{}",
+        json!({"id":"after-limit","method":"pane.get","params":{"pane_id":"w1:p1"}})
+    )
+    .unwrap();
+    let mut reply = String::new();
+    std::io::BufRead::read_line(&mut std::io::BufReader::new(relay), &mut reply).unwrap();
+    assert_eq!(
+        reply,
+        "{\"id\":\"after-limit\",\"result\":{\"type\":\"ok\"}}\n"
     );
     let lease = rpc(&mut first, &meta, "acquire", 0, json!({}));
     let generation = lease["generation"].as_u64().unwrap();
@@ -241,6 +372,9 @@ fn black_box_holder_survives_attach_loss_leases_redraw_and_explicit_kill() {
     drop(reattached);
     let bad = jail.run(&["kill", meta["id"].as_str().unwrap()]);
     assert!(!bad.status.success());
+    // A registry it cannot write never keeps the holder serving a killed child.
+    let state = jail.root.join("state/herdr-shield");
+    std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o500)).unwrap();
     let kill = jail.run(&[
         "kill",
         meta["id"].as_str().unwrap(),
@@ -253,6 +387,8 @@ fn black_box_holder_survives_attach_loss_leases_redraw_and_explicit_kill() {
         String::from_utf8_lossy(&kill.stderr)
     );
     wait(|| !std::path::Path::new(&format!("/proc/{child}")).exists());
+    wait(|| !std::path::Path::new(&format!("/proc/{holder}")).exists());
+    std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o700)).unwrap();
     println!(
         "CLEANUP owned child {child}; holder {holder}; unit {}",
         meta["unit"]

@@ -51,7 +51,7 @@ pub struct Terminal {
     pub revision: u64,
     pub events: Events,
     pub sideband: sideband::Sideband,
-    strings: sideband::Strings,
+    pub strings: sideband::Strings,
     pub theme: alacritty_terminal::term::color::Colors,
     pub theme_policy: String,
     pub query_error: Option<String>,

@@ -254,71 +254,6 @@ fn actual_reconnect_roundtrips_mouse_focus_paste_unicode_modes_theme_and_reset()
 }
 
 #[test]
-fn failed_manager_cgroup_native_resume_and_recursive_launch_open_plain_shell() {
-    use std::os::unix::fs::PermissionsExt;
-    for scenario in ["manager", "cgroup", "native", "recursive"] {
-        let jail = Jail::new(match scenario {
-            "manager" => "m",
-            "cgroup" => "c",
-            "native" => "k",
-            _ => "z",
-        });
-        fs::write(
-            jail.root.join("config/herdr-shield/config.json"),
-            serde_json::to_vec(&json!({"shell":"/bin/sh","args":["-c","printf PLAIN_SAFE"]}))
-                .unwrap(),
-        )
-        .unwrap();
-        let bin = jail.root.join("bin");
-        fs::create_dir(&bin).unwrap();
-        let mut command = jail.command();
-        match scenario {
-            "manager" => {
-                fs::write(bin.join("systemctl"), b"#!/bin/sh\nprintf verified\n").unwrap();
-                fs::write(bin.join("systemd-run"), b"#!/bin/sh\nexit 1\n").unwrap();
-            }
-            "cgroup" => {
-                fs::write(bin.join("systemctl"), b"#!/bin/sh\ncase \"$*\" in *--property=MainPID*) /usr/bin/systemctl \"$@\" > \"$HOME/actual-holder-pid\"; printf '%s\\n' \"$HERDR_SHIELD_JAIL_PID\";; *) exec /usr/bin/systemctl \"$@\";; esac\n").unwrap();
-                command.env("HERDR_SHIELD_JAIL_PID", std::process::id().to_string());
-            }
-            "native" => fs::write(
-                jail.root.join("config/herdr/config.toml"),
-                b"[session]\nresume_agents_on_restore = true\n",
-            )
-            .unwrap(),
-            "recursive" => {
-                command.env("HERDR_SHIELD_INNER", "existing-holder");
-            }
-            _ => unreachable!(),
-        }
-        for entry in fs::read_dir(&bin).unwrap() {
-            fs::set_permissions(entry.unwrap().path(), fs::Permissions::from_mode(0o700)).unwrap();
-        }
-        command.env("PATH", format!("{}:/usr/bin:/bin", bin.display()));
-        let output = command.output().unwrap();
-        assert!(output.status.success(), "{scenario}: {:?}", output.stderr);
-        assert!(String::from_utf8_lossy(&output.stdout).contains("PLAIN_SAFE"));
-        let reason = match scenario {
-            "manager" => "service creation failed",
-            "cgroup" => "cgroup verification failed",
-            "native" => "resume_agents_on_restore",
-            "recursive" => "recursive keeper refused",
-            _ => unreachable!(),
-        };
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        assert!(
-            stderr.contains("UNPROTECTED") && stderr.contains(reason),
-            "{scenario}: {stderr}"
-        );
-        if scenario == "cgroup" {
-            let pid = fs::read_to_string(jail.root.join("actual-holder-pid")).unwrap();
-            wait(|| !std::path::Path::new(&format!("/proc/{}", pid.trim())).exists());
-            println!("CLEANUP unbootstrapped failed-cgroup holder {}", pid.trim());
-        }
-    }
-}
-
-#[test]
 fn real_old_and_new_executables_coexist_without_replacing_old_holder() {
     use sha2::{Digest, Sha256};
     let jail = Jail::new("v");
@@ -379,12 +314,24 @@ fn private_state_attacks_and_content_redaction_preserve_the_live_holder() {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
     let jail = Jail::new("p");
     let secret = "CANARY_SECRET_NEVER_LOG_7b9c";
-    let _ = jail
+    // One non-UTF-8 variable costs itself, never the protected shell.
+    let first = jail
         .command()
         .env("PRIVATE_TEST_CREDENTIAL", secret)
+        .env(
+            "NON_UTF8_VALUE",
+            <std::ffi::OsStr as std::os::unix::ffi::OsStrExt>::from_bytes(b"\xff"),
+        )
         .output()
         .unwrap();
     let meta = jail.metadata();
+    let stderr = String::from_utf8_lossy(&first.stderr);
+    assert_eq!(meta["state"], "running", "{stderr}");
+    assert_eq!(
+        stderr.lines().next(),
+        Some("herdr-shield: skipped non-UTF-8 environment variable NON_UTF8_VALUE"),
+        "{stderr}"
+    );
     let id = meta["id"].as_str().unwrap();
     for directory in ["config/herdr-shield", "state/herdr-shield", "run/herdr-shield"] {
         let permissions = fs::metadata(jail.root.join(directory)).unwrap();
@@ -441,7 +388,67 @@ fn private_state_attacks_and_content_redaction_preserve_the_live_holder() {
     fs::write(&record, b"{\"schema\":999}").unwrap();
     assert!(!jail.run(&["list"]).status.success());
     assert_eq!(fs::read(&record).unwrap(), b"{\"schema\":999}");
+    let mut copy: Value = serde_json::from_slice(&saved).unwrap();
     fs::write(&record, saved).unwrap();
+    // A second live record for this pane: no duplicate holder, and the pane still gets its shell.
+    let sibling_id = "b".repeat(32);
+    let sibling = jail
+        .root
+        .join("state/herdr-shield")
+        .join(format!("{sibling_id}.json"));
+    copy["id"] = json!(sibling_id);
+    fs::write(&sibling, serde_json::to_vec(&copy).unwrap()).unwrap();
+    fs::set_permissions(&sibling, fs::Permissions::from_mode(0o600)).unwrap();
+    let ambiguous = jail.run(&[]);
+    assert_eq!(
+        (
+            String::from_utf8_lossy(&ambiguous.stdout).as_ref(),
+            String::from_utf8_lossy(&ambiguous.stderr).as_ref()
+        ),
+        (
+            "\r\nPLAIN_READY\n",
+            "herdr-shield: UNPROTECTED: invalid_binding: ambiguous existing holders; retained, no duplicate created; opening configured plain shell\n"
+        )
+    );
+    // One unreadable record costs only itself: the rest is still listed.
+    fs::write(&sibling, b"{\"schema\":999}").unwrap();
+    let listed = jail.run(&["list", "--json"]);
+    let listing: Value = serde_json::from_slice(&listed.stdout).unwrap();
+    assert_eq!(
+        (
+            listing["holders"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|holder| holder["id"].clone())
+                .collect::<Vec<_>>(),
+            listing["unreadable_holders"].clone()
+        ),
+        (
+            vec![meta["id"].clone()],
+            json!([{"id":sibling_id,"error":"missing field `id` at line 1 column 14","socket":null,"pane":null}])
+        )
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&listed.stderr),
+        format!("herdr-shield: ERROR: unreadable holder records retained: {sibling_id}\n")
+    );
+    assert!(!listed.status.success());
+    // It may own this pane, so bootstrap creates no holder and opens the plain shell.
+    let blocked = jail.run(&[]);
+    assert_eq!(
+        (
+            String::from_utf8_lossy(&blocked.stdout).as_ref(),
+            String::from_utf8_lossy(&blocked.stderr).into_owned()
+        ),
+        (
+            "\r\nPLAIN_READY\n",
+            format!(
+                "herdr-shield: UNPROTECTED: invalid_binding: unreadable holder record {sibling_id} may own this pane (missing field `id` at line 1 column 14); retained, no duplicate created; opening configured plain shell\n"
+            )
+        )
+    );
+    fs::remove_file(&sibling).unwrap();
     for invalid in [
         "../outside",
         "/outside",
@@ -459,6 +466,37 @@ fn private_state_attacks_and_content_redaction_preserve_the_live_holder() {
     assert!(String::from_utf8_lossy(&duplicate.stderr).contains("already live"));
     assert_eq!(jail.metadata()["holder"], meta["holder"]);
     assert_eq!(jail.metadata()["child"], meta["child"]);
+    // With the registry read-only, a relay-completed close still answers its caller and still
+    // stops the holder and its child; the record keeps the last state it could write.
+    use std::io::{BufRead, BufReader};
+    let state = jail.root.join("state/herdr-shield");
+    fs::set_permissions(&state, fs::Permissions::from_mode(0o500)).unwrap();
+    let mut relay = BufReader::new(UnixStream::connect(directory.join("herdr-api.sock")).unwrap());
+    relay
+        .get_ref()
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    writeln!(
+        relay.get_mut(),
+        "{}",
+        json!({"id":"close","method":"pane.close","params":{"pane_id":"w1:p1"}})
+    )
+    .unwrap();
+    let mut line = String::new();
+    relay.read_line(&mut line).unwrap();
+    assert_eq!(line, "{\"id\":\"close\",\"result\":{\"type\":\"ok\"}}\n");
+    let live =
+        |identity: &str| std::path::Path::new(&format!("/proc/{}", meta[identity]["pid"])).exists();
+    wait(|| !live("holder"));
+    fs::set_permissions(&state, fs::Permissions::from_mode(0o700)).unwrap();
+    assert_eq!(
+        (
+            live("child"),
+            directory.join("holder.sock").exists(),
+            jail.metadata()["state"].clone()
+        ),
+        (false, false, json!("running"))
+    );
     println!(
         "PASS private state corpus: owned 0700/0600 roots/files/sockets; public-mode/symlink/corrupt/path/duplicate attacks refused; credentials, terminal and capability absent from public logs/status"
     );

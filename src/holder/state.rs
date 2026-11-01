@@ -170,6 +170,13 @@ impl State {
         Ok(json!({"state":"running","child":self.meta.child}))
     }
 
+    /// Writes the record; a failed write is logged and the holder keeps its in-memory state.
+    pub fn persist(&self) {
+        if let Err(error) = self.meta.save(&self.paths) {
+            eprintln!("herdr-shield: holder record save failed: {error}; still serving");
+        }
+    }
+
     pub fn bind(&mut self, binding: Binding) -> Result<Value> {
         if binding.socket != self.meta.birth.socket {
             return fail("invalid_binding: different session endpoint");
@@ -180,10 +187,21 @@ impl State {
             return fail("invalid_binding: server identity mismatch");
         }
         if self.meta.binding != binding {
-            if self.meta.history.len() >= 256 {
-                return fail("invalid_binding: alias history capacity reached; holder retained");
+            let previous = &self.meta.binding;
+            // History feeds alias mapping by public IDs alone: a rebind that keeps them
+            // (a server restart) adds nothing to it.
+            if !self.meta.history.iter().any(|entry| {
+                entry.pane == previous.pane
+                    && entry.tab == previous.tab
+                    && entry.workspace == previous.workspace
+            }) {
+                if self.meta.history.len() >= 256 {
+                    return fail(
+                        "invalid_binding: alias history capacity reached; holder retained",
+                    );
+                }
+                self.meta.history.push(previous.clone());
             }
-            self.meta.history.push(self.meta.binding.clone());
             self.meta.binding = binding;
             self.meta.generation = self
                 .meta
@@ -350,5 +368,55 @@ mod tests {
         );
         assert!(state.check_lease("owner", 2, &payload).is_ok());
         assert!(state.check_lease("owner", 2, &payload).is_err());
+    }
+
+    #[test]
+    fn rebinds_between_known_public_ids_never_exhaust_alias_history() {
+        let root =
+            std::env::temp_dir().join(format!("bind-{}", crate::config::random_id().unwrap()));
+        crate::config::secure_dir(&root).unwrap();
+        let socket = root.join("herdr.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        let identity = Identity::read(std::process::id()).unwrap();
+        let binding = |pane: &str| Binding {
+            socket: socket.clone(),
+            pane: pane.into(),
+            tab: "w1:t1".into(),
+            workspace: "w1".into(),
+            server: identity.clone(),
+        };
+        let mut state = State {
+            paths: Paths {
+                home: root.clone(),
+                config: root.clone(),
+                state: root.clone(),
+                runtime: root.clone(),
+            },
+            meta: Metadata::new(binding("w1:p1"), "/".into()).unwrap(),
+            terminal: Arc::new(Mutex::new(Terminal::new(Size::new(24, 80).unwrap()))),
+            writer: None,
+            master: None,
+            child: None,
+            lease: None,
+            stopping: false,
+        };
+        for round in 0..300 {
+            let pane = if round % 2 == 0 { "w1:p2" } else { "w1:p1" };
+            if let Err(error) = state.bind(binding(pane)) {
+                panic!("rebind {round} to {pane} refused: {error}");
+            }
+            drop(listener.accept().unwrap());
+        }
+        assert_eq!(
+            state
+                .meta
+                .history
+                .iter()
+                .map(|entry| entry.pane.as_str())
+                .collect::<Vec<_>>(),
+            ["w1:p1", "w1:p2"]
+        );
+        assert_eq!(state.meta.generation, 301);
+        std::fs::remove_dir_all(root).unwrap();
     }
 }
