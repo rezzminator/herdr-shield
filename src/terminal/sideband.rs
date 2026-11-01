@@ -1,3 +1,7 @@
+use base64::{
+    Engine, alphabet,
+    engine::{DecodePaddingMode, GeneralPurpose, GeneralPurposeConfig},
+};
 use serde_json::{Value, json};
 use std::collections::VecDeque;
 
@@ -36,7 +40,12 @@ impl Strings {
             return None;
         }
         if !self.overflow {
-            if self.pending.len() < 4096 {
+            let limit = if self.pending.starts_with(CLIPBOARD) {
+                CLIPBOARD_MAX
+            } else {
+                4096
+            };
+            if self.pending.len() < limit {
                 self.pending.push(byte);
             } else {
                 self.pending.clear();
@@ -53,6 +62,30 @@ impl Strings {
         }
         None
     }
+}
+
+const CLIPBOARD: &[u8] = b"\x1b]52;";
+/// Bounds one clipboard write, the one event a snapshot frame carries this large.
+const CLIPBOARD_MAX: usize = 64 * 1024;
+
+/// Standard base64, padded or not and with any trailing bits, as terminals
+/// accept it in OSC 52.
+const CLIPBOARD_BASE64: GeneralPurpose = GeneralPurpose::new(
+    &alphabet::STANDARD,
+    GeneralPurposeConfig::new()
+        .with_decode_padding_mode(DecodePaddingMode::Indifferent)
+        .with_decode_allow_trailing_bits(true),
+);
+
+/// An OSC 52 clipboard write (never a `?` read): selection targets, empty
+/// meaning xterm's `s0`, and a non-empty payload that decodes as base64.
+fn clipboard_write(value: &str) -> bool {
+    value.split_once(';').is_some_and(|(targets, data)| {
+        targets.len() <= 8
+            && targets.bytes().all(|byte| b"cpqs01234567".contains(&byte))
+            && !data.is_empty()
+            && CLIPBOARD_BASE64.decode(data).is_ok()
+    })
 }
 
 #[derive(Default)]
@@ -122,6 +155,18 @@ impl Sideband {
                     col + 1
                 ))
             }
+            // A live write reaches the attached pane, as it would unwrapped; since()
+            // never replays it on reconnect, so detached output cannot reach the
+            // outer clipboard. A newer write supersedes one not yet delivered; the
+            // older event stays, emptied, so its sequence never reads as a gap.
+            "52" if clipboard_write(value) => {
+                for (_, event) in &mut self.events {
+                    if event.as_bytes().starts_with(CLIPBOARD) {
+                        event.clear();
+                    }
+                }
+                Some(format!("\x1b]52;{value}\x1b\\"))
+            }
             _ => None,
         };
         if let Some(approved) = approved {
@@ -173,18 +218,51 @@ mod tests {
             b"\x1b]133;A\x07",
             b"\x1b]2;title\x1b\\",
             b"\x1b]133;C\x07",
-            b"\x1b]52;c;SECRET\x07",
+            b"\x1b]52;c;T0xE\x07",
+            b"\x1b]52;c;?\x07",
+            b"\x1b]52;c;not base64!\x07",
+            b"\x1b]52;c;U0VDUkVU\x1b\\",
         ] {
             sideband.control(bytes, 1, 2);
         }
         let live = sideband.since(Some(0));
         let text = live["data"].as_str().unwrap();
         assert!(text.find("133;A").unwrap() < text.find("133;C").unwrap());
-        assert!(!text.contains("SECRET"));
+        // A live clipboard write reaches the attached pane once; only the newest is kept.
+        assert_eq!(
+            text,
+            "\x1b]7;file:///work\x1b\\\x1b[2;3H\x1b]133;A\x1b\\\x1b]2;title\x1b\\\x1b[2;3H\x1b]133;C\x1b\\\x1b]52;c;U0VDUkVU\x1b\\"
+        );
         let reconnect = sideband.since(None);
-        assert!(!reconnect["data"].as_str().unwrap().contains("133;"));
-        assert!(reconnect["data"].as_str().unwrap().contains("file:///work"));
-        assert_eq!(sideband.since(Some(4))["data"], "");
+        assert_eq!(
+            reconnect["data"], "\x1b]7;file:///work\x1b\\\x1b]2;title\x1b\\",
+            "reconnect replays no prompt marker or clipboard write"
+        );
+        let behind = sideband.since(Some(4));
+        assert_eq!(behind["gap"], false);
+        assert_eq!(behind["data"], "\x1b]52;c;U0VDUkVU\x1b\\");
+        assert_eq!(sideband.since(Some(6))["data"], "");
+    }
+    #[test]
+    fn clipboard_write_needs_decodable_base64_and_xterm_targets() {
+        for (value, write) in [
+            ("c;T0xE", true),
+            (";T0xE", true),
+            ("c;U0VDUkVU", true),
+            ("c;SECRET", true),
+            ("c;TElWRQ==", true),
+            ("pqs01234;T0xE", true),
+            ("c;?", false),
+            ("c;", false),
+            ("c;not base64!", false),
+            ("c;U0VDUkVU=", false),
+            ("c;=T0xE", false),
+            ("x;T0xE", false),
+            ("cpqs01234;T0xE", false),
+            ("T0xE", false),
+        ] {
+            assert_eq!(clipboard_write(value), write, "{value:?}");
+        }
     }
     #[test]
     fn unterminated_strings_are_bounded_and_chunks_do_not_change_semantics() {
@@ -199,6 +277,17 @@ mod tests {
         }
         assert!(filter.byte(7).is_none());
         assert_eq!(filter.byte(b'X'), Some(vec![b'X']));
+        for (length, kept) in [(CLIPBOARD_MAX - 8, true), (CLIPBOARD_MAX - 7, false)] {
+            let mut write = b"\x1b]52;c;".to_vec();
+            write.extend(std::iter::repeat_n(b'A', length));
+            write.push(7);
+            let total = write.len();
+            let out: Vec<_> = write
+                .into_iter()
+                .filter_map(|byte| filter.byte(byte))
+                .collect();
+            assert_eq!(out.len(), usize::from(kept), "{total}-byte clipboard write");
+        }
     }
 
     #[test]
@@ -211,11 +300,14 @@ mod tests {
                 terminal.feed(bytes);
             }
             let live = terminal.sideband.since(Some(0));
-            assert_eq!(live["sequence"], 6);
+            assert_eq!(live["sequence"], 7);
             let text = live["data"].as_str().unwrap();
             assert!(text.contains("file:///work"));
             assert!(text.contains("safe title"));
-            assert!(!text.contains("SECRET"));
+            assert!(
+                text.ends_with("\x1b]133;D;0\x1b\\\x1b]52;c;SECRET\x1b\\"),
+                "{text:?}"
+            );
             assert!(!text.contains("bad"));
             let mut previous = 0;
             for marker in ["133;A", "133;B", "133;C", "133;D;0"] {

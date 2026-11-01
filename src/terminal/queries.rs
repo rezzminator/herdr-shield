@@ -72,7 +72,8 @@ pub fn reply(
             cell_width: 0,
             cell_height: 0,
         })),
-        // Clipboard reads/writes are deliberately denied, including detached output.
+        // The emulator answers no clipboard read or write; live writes reach the
+        // attached pane through the audited sideband, never detached output.
         _ => None,
     }
 }

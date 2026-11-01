@@ -277,7 +277,7 @@ fn dispatch(state: &mut State, owner: &str, frame: &Frame) -> Result<(&'static s
                 .terminal
                 .lock()
                 .map_err(|_| "terminal mutex poisoned")?;
-            json!({"id":state.meta.id,"version":state.meta.version,"child":state.meta.child,"state":state.meta.state,"attached":state.lease.is_some(),"reason":state.meta.reason,"binding":state.meta.binding,"generation":state.meta.generation,"resume_status":state.meta.resume_status,"features":["binding-proof-v1","terminal-sideband-v1","theme-v1"],"terminal":{"theme_policy":terminal.theme_policy,"query_error":terminal.query_error,"sideband_policy":"bounded audited OSC7 cwd, OSC133 boundaries, OSC0/2 title; reconnect restores latest cwd/title, not historical commands","sideband_sequence":terminal.sideband.sequence},"cleanup":format!("herdr-shield kill {}",state.meta.id)})
+            json!({"id":state.meta.id,"version":state.meta.version,"child":state.meta.child,"state":state.meta.state,"attached":state.lease.is_some(),"reason":state.meta.reason,"binding":state.meta.binding,"generation":state.meta.generation,"resume_status":state.meta.resume_status,"features":["binding-proof-v1","terminal-sideband-v1","theme-v1"],"terminal":{"theme_policy":terminal.theme_policy,"query_error":terminal.query_error,"sideband_policy":"bounded audited OSC7 cwd, OSC133 boundaries, OSC0/2 title, live OSC52 clipboard writes; reconnect restores latest cwd/title, not historical commands or clipboard writes","sideband_sequence":terminal.sideband.sequence},"cleanup":format!("herdr-shield kill {}",state.meta.id)})
         })),
         "detach" => {
             state.detached(owner)?;

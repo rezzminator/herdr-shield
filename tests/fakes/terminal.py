@@ -39,6 +39,8 @@ elif mode == 'flood':
     os.write(1, b'\x1b[2J\x1b[H\x1b[?2004h\x1b[?1006h\x1b[?1002h\x1b[?1004h\x1b[4;7HFINAL\x1b[?25l')
     (root / 'flood-done').write_text('33554432')
 elif mode == 'input':
+    # A clipboard write made before any attach must never reach a later attachment.
+    os.write(1, b'\x1b]52;c;REVUQUNIRUQ=\x07')
     os.write(1, b'\x1b[2J\x1b[H\x1b[?1049h\x1b[?2004h\x1b[?1006h\x1b[?1002h\x1b[?1004h\x1b[?1h\x1b=\x1b[2;3H\xe7\x95\x8ce\xcc\x81\x1b]8;;https://example.invalid/\x1b\\link\x1b]8;;\x1b\\')
     data = bytearray()
     while True:
@@ -46,6 +48,6 @@ elif mode == 'input':
         (root / 'input-transcript').write_bytes(data)
         if data.endswith(b'DONE'):
             break
-    os.write(1, b'\x1bcRESET_OK')
+    os.write(1, b'\x1bcRESET_OK\x1b]52;c;TElWRQ==\x07')
 while True:
     time.sleep(1)
