@@ -89,7 +89,7 @@ fn observe(shared: Shared) -> Result<()> {
     serde_json::to_writer(&mut socket, &request)?;
     socket.write_all(b"\n")?;
     socket.set_read_timeout(None)?;
-    follow(&mut BufReader::new(socket), &shared, &meta)
+    follow(&mut BufReader::new(socket), &shared, meta)
 }
 
 /// The restored pane's public IDs from pane.get; only these are read, so a field the pinned
@@ -112,8 +112,9 @@ fn skipped(value: &Value) -> String {
     )
 }
 
-/// Follows the subscription until a typed event for this generation is acted on.
-fn follow(reader: &mut impl BufRead, shared: &Shared, meta: &Metadata) -> Result<()> {
+/// Follows the subscription until a close is acted on or the binding changes elsewhere; its own
+/// move rebinds keep it, since a re-subscribe would drop every event sent before it lands.
+fn follow(reader: &mut impl BufRead, shared: &Shared, mut meta: Metadata) -> Result<()> {
     loop {
         let value: Value = crate::config::decode_json(&super::line(reader)?)?;
         if !value["error"].is_null() {
@@ -154,7 +155,8 @@ fn follow(reader: &mut impl BufRead, shared: &Shared, meta: &Metadata) -> Result
                         workspace: pane.workspace_id.clone(),
                     };
                     state.bind(binding)?;
-                    return Ok(());
+                    meta = state.meta.clone();
+                    continue;
                 }
             }
             if let super::schema::EventData::PaneClosed { pane_id, .. } = event.data {
@@ -183,15 +185,18 @@ mod tests {
     use super::*;
 
     #[test]
-    fn unpinned_event_is_skipped_and_the_subscription_reaches_the_next() {
+    fn one_subscription_follows_every_move_and_skipped_event_to_the_close() {
         use crate::config::{Paths, random_id, secure_dir};
         use crate::holder::{registry::Binding, state::State};
         use crate::terminal::{Size, Terminal};
         use std::sync::{Arc, Mutex};
         let root = std::env::temp_dir().join(format!("observer-{}", random_id().unwrap()));
         secure_dir(&root).unwrap();
+        // Each rebind proves the server identity over a fresh connection; the backlog accepts it.
+        let socket = root.join("herdr.sock");
+        let _listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
         let binding = Binding {
-            socket: "/absent.sock".into(),
+            socket,
             pane: "w1:p1".into(),
             tab: "w1:t1".into(),
             workspace: "w1".into(),
@@ -214,10 +219,15 @@ mod tests {
             lease: None,
             stopping: false,
         }));
+        // Two moves back to back: the second lands before any re-subscribe could.
         let events = concat!(
-            r#"{"event":"pane_future","data":{"type":"pane_future","pane_id":"w1:p1"}}"#,
+            r#"{"event":"pane_moved","data":{"type":"pane_moved","previous_pane_id":"w1:p1","previous_tab_id":"w1:t1","previous_workspace_id":"w1","pane":{"pane_id":"w2:p1","terminal_id":"t1","workspace_id":"w2","tab_id":"w2:t1","focused":true,"agent_status":"unknown","revision":1}}}"#,
             "\n",
-            r#"{"event":"pane_closed","data":{"type":"pane_closed","pane_id":"w1:p1","workspace_id":"w1"}}"#,
+            r#"{"event":"pane_future","data":{"type":"pane_future","pane_id":"w2:p1"}}"#,
+            "\n",
+            r#"{"event":"pane_moved","data":{"type":"pane_moved","previous_pane_id":"w2:p1","previous_tab_id":"w2:t1","previous_workspace_id":"w2","pane":{"pane_id":"w3:p1","terminal_id":"t1","workspace_id":"w3","tab_id":"w3:t1","focused":true,"agent_status":"unknown","revision":1}}}"#,
+            "\n",
+            r#"{"event":"pane_closed","data":{"type":"pane_closed","pane_id":"w3:p1","workspace_id":"w3"}}"#,
             "\n"
         );
         assert_eq!(
@@ -226,11 +236,28 @@ mod tests {
             ),
             "herdr-shield: observer skipped event \"pane_future\", which the pinned v22 schema lacks"
         );
-        follow(&mut std::io::Cursor::new(events), &shared, &meta).unwrap();
+        follow(&mut std::io::Cursor::new(events), &shared, meta.clone()).unwrap();
         let state = shared.lock().unwrap();
         assert_eq!(
-            (state.meta.state.as_str(), state.stopping),
-            ("terminated", true)
+            (
+                state.meta.binding.pane.as_str(),
+                state
+                    .meta
+                    .history
+                    .iter()
+                    .map(|entry| entry.pane.as_str())
+                    .collect::<Vec<_>>(),
+                state.meta.generation,
+                state.meta.state.as_str(),
+                state.stopping
+            ),
+            (
+                "w3:p1",
+                vec!["w1:p1", "w2:p1"],
+                meta.generation + 2,
+                "terminated",
+                true
+            )
         );
         drop(state);
         std::fs::remove_dir_all(root).unwrap();

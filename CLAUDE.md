@@ -13,7 +13,8 @@ A mistaken binding, close signal or recovery decision can terminate a living wor
 - reconciliation: coverage, orphan reporting and authenticated close observation · `src/herdr/reconcile.rs`, `src/herdr/observer.rs`
 - lifetime: user-service placement and PID/boot/start identity checks · `src/lifetime/`
 - test jail: dummy workloads, isolated paths and owned-resource cleanup · `tests/jail.rs`, `tests/herdr/jail.py`, `tests/herdr/real.py`, `tests/fakes/`
-- checks: structural, mutation and real-Herdr gates · `scripts/checks.sh`, `scripts/gate_run.py`, `scripts/test-herdr.sh`
+- checks: structural, mutation and real-Herdr gates · `Makefile`, `scripts/gate.sh`, `scripts/checks.sh`, `scripts/gate_run.py`, `scripts/test-herdr.sh`, `scripts/release-check.sh`, `pins.env`
+- CI: `ci.yml` runs `make check` (ubuntu-latest only) and `make release` on a pull request into `main`; its `ci` job is the required check; `publish.yml` tags and releases on that pull request's merge · `.github/workflows/`
 - acceptance contract: numbered promises, launch-door census and verification gaps · `docs/spec.md`
 
 # Runtime
@@ -27,10 +28,9 @@ A mistaken binding, close signal or recovery decision can terminate a living wor
 
 ## Build and verification
 
-- Use the pinned `rust-toolchain.toml` and `Cargo.lock`.
-- Create one short throwaway root; export it as TMPDIR and place HOME, every XDG root including XDG_RUNTIME_DIR, CARGO_HOME and CARGO_TARGET_DIR beneath it. Set HERDR_SHIELD_TEST_ROOT to a fresh absolute subdirectory there.
-- Run `cargo fmt --all -- --check`, `cargo clippy --all-targets --all-features -- -D warnings`, `cargo test --all-targets --all-features` and `bash scripts/checks.sh`.
-- For real-Herdr verification, set HERDR_SHIELD_BUILD_ROOT to the private throwaway root, HERDR_SHIELD_BIN to the absolute debug executable and HERDR_SHIELD_OLD_BIN to a preserved compatible prior executable; run `bash scripts/test-herdr.sh --herdr <pinned-v0.9.5-binary>`.
+- Use the pinned `rust-toolchain.toml`, `Cargo.lock` and the Herdr release in `pins.env`.
+- Verify with `make check`: one short throwaway root holds TMPDIR, HOME, every XDG root including XDG_RUNTIME_DIR, CARGO_HOME and CARGO_TARGET_DIR; it downloads and SHA-256-verifies the pinned Herdr and runs `cargo fmt`, `cargo clippy -D warnings`, a release build (the distinct old executable HERDR_SHIELD_OLD_BIN), `cargo test --all-targets --all-features`, `scripts/checks.sh` and `scripts/test-herdr.sh`; a failed run keeps its root and prints the path.
+- `make release`: Cargo.toml's version is the one version; `herdr-plugin.toml`, its `CHANGELOG.md` section and `releases/v{version}.md` agree, and tag `v{version}` does not exist yet.
 - Report acceptance rows against watched results. Missing tools, refused backends, timeouts, skipped tests and undiscovered suites are named gaps, never passes; a regression counts after its unfixed failure was observed.
 
 # Rules

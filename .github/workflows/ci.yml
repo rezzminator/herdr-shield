@@ -1,0 +1,69 @@
+name: ci
+
+# The one check. A pull request into main (the release pull request from develop)
+# runs `make check` and `make release`; `ci` is main's only required status check,
+# so nothing merges, releases or publishes until it is green.
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    strategy:
+      fail-fast: false
+      matrix:
+        # Linux only: holders are systemd user services, so there is no macos-15 leg.
+        os: [ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install the toolchain rust-toolchain.toml pins
+        run: rustup toolchain install
+
+      - name: Start a systemd user manager for the holders' transient units
+        # The runner user has no login session, so its user@.service is not running;
+        # linger starts it, and the holders' units land under it, outside any session scope.
+        run: |
+          set -euo pipefail
+          uid="$(id -u)"
+          sudo loginctl enable-linger "$(id -un)"
+          sudo systemctl start "user@$uid.service"
+          timeout 60 bash -c "until systemctl --user --machine=$uid@.host show --property=Version --value | grep -q .; do sleep 1; done"
+
+      - name: fmt, clippy, tests, structural checks, real Herdr
+        run: make check
+
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out with tags
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Version, changelog and release note agree; the tag is new
+        run: make release
+
+  ci:
+    name: ci
+    needs: [check, release]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Every job succeeded
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+        run: |
+          set -euo pipefail
+          failed="$(jq -r 'to_entries[] | select(.value.result != "success") | "\(.key)=\(.value.result)"' <<<"$NEEDS")"
+          if [ -n "$failed" ]; then
+            echo "::error::not every CI job succeeded: $(tr '\n' ' ' <<<"$failed")"
+            exit 1
+          fi
+          echo "every CI job succeeded"

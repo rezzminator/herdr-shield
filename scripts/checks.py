@@ -2,10 +2,11 @@
 """Apply the same structural validator to production files and mutated controls."""
 import pathlib
 import re
+import subprocess
 import sys
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
-FORBIDDEN = re.compile(r'(?i)' + 'pro' + 'fessor' + r'|\b' + 'p' + 'fm' + r'\b|/ho' + r'me/|/U' + r'sers/')
+FORBIDDEN = re.compile(r'(?i)' + 'pro' + 'fessor' + r'|\b' + 'p' + 'fm' + r'\b|/ho' + r'me/|/U' + r'sers/|herdr[-_]' + 'keep')
 
 
 def audit(files):
@@ -18,7 +19,7 @@ def audit(files):
             errors.append('source exceeds 800 lines: ' + name)
         if name.startswith('docs/') and (len(text.splitlines()) > 500 or len(text.encode()) > 81920):
             errors.append('doc exceeds topic limit: ' + name)
-        if name.startswith(('src/', 'tests/', 'scripts/')) and FORBIDDEN.search(text):
+        if FORBIDDEN.search(text):
             errors.append('forbidden origin or machine path: ' + name)
         if name.startswith('src/') and name.endswith('.rs'):
             if re.search(r'(?:std::process::)?Command::new\s*\(', text) and name != 'src/shell.rs':
@@ -48,13 +49,26 @@ def audit(files):
     return errors
 
 
+def published():
+    """Every text file git would publish: tracked, plus untracked files no ignore rule hides."""
+    listed = subprocess.run(['git', 'ls-files', '-z', '--cached', '--others', '--exclude-standard'],
+                            cwd=ROOT, capture_output=True, check=False)
+    if listed.returncode != 0:
+        sys.exit('ERROR: could not enumerate published files: git ls-files exited '
+                 f'{listed.returncode}: {listed.stderr.decode(errors="replace").strip()}')
+    files = {}
+    for name in sorted(set(listed.stdout.decode().split('\0')) - {''}):
+        path = ROOT / name
+        if not path.is_file():
+            continue  # deleted in the working tree: it ships no content
+        data = path.read_bytes()
+        if b'\0' not in data:  # an image or other binary carries no text line to scan
+            files[name] = data.decode()
+    return files
+
+
 def main():
-    paths = []
-    for directory in ('src', 'tests', 'scripts', 'docs'):
-        paths.extend(path for path in (ROOT / directory).rglob('*')
-                     if path.is_file() and path.suffix in ('.rs', '.py', '.sh', '.md'))
-    paths.extend([ROOT / 'herdr-plugin.toml', ROOT / 'Cargo.toml'])
-    files = {str(path.relative_to(ROOT)): path.read_text() for path in paths}
+    files = published()
     errors = audit(files)
     if errors:
         sys.exit('\n'.join('ERROR: ' + error for error in errors))
@@ -67,6 +81,13 @@ def main():
         ('forbidden origin', 'tests/broken.rs', '// /ho' + 'me/example'),
         ('forbidden origin', 'tests/broken.rs', '// ' + 'p' + 'fm'),
         ('forbidden origin', 'tests/broken.rs', '// /U' + 'sers/example'),
+        ('forbidden origin', 'docs/broken-control.md', '`/tmp/' + 'pro' + 'fessor/evidence/`'),
+        ('forbidden origin', 'tests/broken.rs', '// herdr-' + 'keep'),
+        ('forbidden origin', 'tests/broken.rs', '// HERDR_' + 'KEEP_INNER'),
+        *(('forbidden origin', name, files[name] + '\n/ho' + 'me/example\n')
+          for name in ('README.md', 'CHANGELOG.md', 'releases/v0.1.0.md', 'CONTRIBUTING.md', 'CODE_OF_CONDUCT.md',
+                       'SECURITY.md', 'SUPPORT.md', '.github/pull_request_template.md',
+                       '.github/ISSUE_TEMPLATE/bug_report.md')),
         ('process facade bypass', 'src/terminal/render.rs', files['src/terminal/render.rs'] + '\nCommand::new("bad");'),
         ('path facade bypass', 'src/terminal/render.rs', files['src/terminal/render.rs'] + '\nstd::env::var_os("HOME");'),
         ('no owning unit test', 'src/terminal/render.rs', files['src/terminal/render.rs'].replace('#[cfg(test)]', '')),
@@ -84,7 +105,7 @@ def main():
             changed[path] = replacement
         failures = audit(changed)
         assert any(error.startswith(expected) for error in failures), ('broken control accepted', expected, failures)
-        print('CONTROL rejected:', expected)
+        print('CONTROL rejected:', expected, path or '')
     changed = {name: text.replace('#[test]', '') if name.startswith('tests/') else text for name, text in files.items()}
     assert 'process test enumeration was empty' in audit(changed)
     print(f'PASS structure: {sum(name.endswith(".rs") for name in files)} Rust files; 102 unique policies; all {len(controls) + 1} actual artifact mutation controls rejected')

@@ -52,7 +52,9 @@ pub fn start(shared: Shared, path: PathBuf) -> Result<()> {
                     tokio::task::spawn_blocking(move || {
                         let _permit = permit;
                         if connection(stream, holder).is_err() {
-                            eprintln!("herdr-shield: API relay connection failed (payload redacted)");
+                            eprintln!(
+                                "herdr-shield: API relay connection failed (payload redacted)"
+                            );
                         }
                     });
                 }

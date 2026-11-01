@@ -16,6 +16,10 @@ import termios
 import threading
 import time
 
+# The Herdr release every real-server test runs against; make check downloads and verifies the same pin.
+PINS = dict(line.split('=', 1) for line in (pathlib.Path(__file__).resolve().parents[2] / 'pins.env').read_text().splitlines()
+            if line and not line.startswith('#'))
+
 
 def identity(pid):
     try:
@@ -60,7 +64,7 @@ class ProcessRecords(list):
 class Jail:
     def __init__(self, root, herdr, keeper):
         assert root.is_absolute() and root.is_dir() and not root.is_symlink()
-        assert hashlib.sha256(pathlib.Path(herdr).read_bytes()).hexdigest() == '14d9e8bc8b4a9e0118d77c32266f76d461f09b40342eb23752960bd89f59929d', 'pinned Herdr artifact required'
+        assert hashlib.sha256(pathlib.Path(herdr).read_bytes()).hexdigest() == PINS['HERDR_SHA256'], 'pinned Herdr artifact required'
         self.root = root / f'h{os.getpid()}'
         assert not self.root.exists(), 'fresh jail required'
         self.root.mkdir(mode=0o700)
@@ -306,7 +310,7 @@ class Jail:
 
 def exercise(jail):
     version = jail.command('--version')
-    assert version.returncode == 0 and '0.9.5' in version.stdout, version.stdout
+    assert version.returncode == 0 and PINS['HERDR_VERSION'] in version.stdout, version.stdout
     print('ARTIFACT herdr sha256', hashlib.sha256(pathlib.Path(jail.herdr).read_bytes()).hexdigest(), flush=True)
     print('ARTIFACT keeper sha256', hashlib.sha256(pathlib.Path(jail.keeper).read_bytes()).hexdigest(), flush=True)
     server = jail.server()
@@ -404,7 +408,7 @@ def exercise(jail):
     before_generation=next(m for m in jail.metadata() if m['id']==meta['id'])['generation']
     before_handoff_terminal = jail.api('pane.get', {'pane_id': pane})['pane']['terminal_id']
     jail.handoff_pending = True
-    result = jail.api('server.live_handoff', {'import_exe': jail.herdr, 'expected_protocol': 22, 'expected_version': '0.9.5'})
+    result = jail.api('server.live_handoff', {'import_exe': jail.herdr, 'expected_protocol': 22, 'expected_version': PINS['HERDR_VERSION']})
     print('HANDOFF result', result, flush=True)
     wait(lambda: server.poll() is not None)
     new_pid = jail.record_handoff_server()

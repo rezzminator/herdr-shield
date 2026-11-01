@@ -209,10 +209,19 @@ fn black_box_holder_survives_attach_loss_leases_redraw_and_explicit_kill() {
     let earlier = r#"{"error":"earlier","action":"retry reconcile"}"#;
     std::fs::write(&last_error, earlier).unwrap();
     let doctor = jail.run(&["doctor"]);
+    let absent = jail.root.join("absent/herdr.sock");
+    let unreachable = jail
+        .command()
+        .env("HERDR_SOCKET_PATH", &absent)
+        .arg("doctor")
+        .output()
+        .unwrap();
     let reconciled = jail.run(&["reconcile"]);
     let [b, c] = &unreadable;
     assert_eq!(
         (
+            String::from_utf8_lossy(&unreachable.stderr).into_owned(),
+            unreachable.status.success(),
             String::from_utf8_lossy(&doctor.stderr).into_owned(),
             doctor.status.success(),
             String::from_utf8_lossy(&reconciled.stderr).into_owned(),
@@ -220,6 +229,11 @@ fn black_box_holder_survives_attach_loss_leases_redraw_and_explicit_kill() {
             std::fs::read_to_string(&last_error).unwrap()
         ),
         (
+            format!(
+                "herdr-shield: Herdr server not reachable at {}: No such file or directory (os error 2)\n",
+                absent.display()
+            ),
+            false,
             format!(
                 "herdr-shield: ERROR: unreadable holder records retained: {b} (missing field `id` at line 1 column 14), {c} (missing field `id` at line 1 column 14)\n"
             ),

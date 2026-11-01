@@ -333,7 +333,11 @@ fn private_state_attacks_and_content_redaction_preserve_the_live_holder() {
         "{stderr}"
     );
     let id = meta["id"].as_str().unwrap();
-    for directory in ["config/herdr-shield", "state/herdr-shield", "run/herdr-shield"] {
+    for directory in [
+        "config/herdr-shield",
+        "state/herdr-shield",
+        "run/herdr-shield",
+    ] {
         let permissions = fs::metadata(jail.root.join(directory)).unwrap();
         assert_eq!(permissions.mode() & 0o777, 0o700);
         assert_eq!(permissions.uid(), nix::unistd::Uid::current().as_raw());

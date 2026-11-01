@@ -362,7 +362,8 @@ mod tests {
 
     #[test]
     fn private_paths_reject_symlinks_public_modes_and_corrupt_json() {
-        let root = std::env::temp_dir().join(format!("herdr-shield-config-{}", random_id().unwrap()));
+        let root =
+            std::env::temp_dir().join(format!("herdr-shield-config-{}", random_id().unwrap()));
         secure_dir(&root).unwrap();
         let linked = root.join("linked");
         std::os::unix::fs::symlink(&root, &linked).unwrap();
